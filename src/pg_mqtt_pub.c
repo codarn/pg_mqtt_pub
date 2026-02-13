@@ -272,15 +272,13 @@ pgmqttpub_outbox_insert(const char *broker_name, const char *topic,
     int  ret;
     bool was_connected;
 
-    was_connected = SPI_connect() == SPI_OK_CONNECT;
-    if (!was_connected)
+    ret = SPI_connect();
+    was_connected = (ret == SPI_ERROR_CONNECT);  /* true if already connected */
+
+    if (!was_connected && ret != SPI_OK_CONNECT)
     {
-        ret = SPI_connect();
-        if (ret != SPI_OK_CONNECT)
-        {
-            elog(WARNING, "pg_mqtt_pub: SPI_connect failed for outbox insert");
-            return false;
-        }
+        elog(WARNING, "pg_mqtt_pub: SPI_connect failed for outbox insert");
+        return false;
     }
 
     {

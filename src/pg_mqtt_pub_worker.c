@@ -426,7 +426,7 @@ drain_outbox(void)
              "FOR UPDATE SKIP LOCKED",
              pgmqttpub_outbox_batch_size);
 
-    ret = SPI_execute(query, true, 0);
+    ret = SPI_execute(query, false, 0);  // false = not read-only (FOR UPDATE acquires locks)
     processed = SPI_processed;
 
     if (ret != SPI_OK_SELECT || processed == 0)

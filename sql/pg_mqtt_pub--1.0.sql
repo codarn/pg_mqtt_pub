@@ -3,12 +3,6 @@
 \echo Use "CREATE EXTENSION pg_mqtt_pub" to load this file. \quit
 
 -- ═══════════════════════════════════════════
---  Schema
--- ═══════════════════════════════════════════
-
-CREATE SCHEMA mqtt_pub;
-
--- ═══════════════════════════════════════════
 --  Outbox Table (Cold Path — WAL-durable)
 --
 --  Written to when broker is disconnected or
@@ -35,8 +29,7 @@ COMMENT ON TABLE mqtt_pub.outbox IS
 
 -- Sequential drain index (worker reads oldest-first)
 CREATE INDEX outbox_drain_idx
-    ON mqtt_pub.outbox (id)
-    WHERE next_retry_at <= now();
+    ON mqtt_pub.outbox (id);
 
 -- Retry scheduling index (skip rows not yet eligible)
 CREATE INDEX outbox_retry_idx
@@ -218,6 +211,7 @@ DECLARE
     _topic        text;
     _payload      jsonb;
     _data         jsonb;
+    _result       boolean;
 BEGIN
     _topic_prefix := TG_ARGV[0];
     _qos          := COALESCE(TG_ARGV[1]::integer, 1);
@@ -249,12 +243,7 @@ BEGIN
         _payload := _data;
     END IF;
 
-    PERFORM mqtt_publish(
-        topic   := _topic,
-        payload := _payload::text,
-        qos     := _qos,
-        broker  := _broker
-    );
+    _result := mqtt_pub.mqtt_publish(_topic, _payload::text, _qos, false, _broker);
 
     IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END;
@@ -281,6 +270,7 @@ DECLARE
     _payload      jsonb;
     _data         jsonb;
     _count        integer;
+    _result       boolean;
 BEGIN
     _topic_prefix := TG_ARGV[0];
     _qos          := COALESCE(TG_ARGV[1]::integer, 1);
@@ -338,12 +328,7 @@ BEGIN
         _payload := _data;
     END IF;
 
-    PERFORM mqtt_publish(
-        topic   := _topic,
-        payload := _payload::text,
-        qos     := _qos,
-        broker  := _broker
-    );
+    _result := mqtt_pub.mqtt_publish(_topic, _payload::text, _qos, false, _broker);
 
     RETURN NULL;
 END;
@@ -382,7 +367,7 @@ BEGIN
         'CREATE OR REPLACE TRIGGER %I
              AFTER %s ON %s
              FOR EACH ROW
-             EXECUTE FUNCTION mqtt_trigger_notify(%L, %L, %L, %L)',
+             EXECUTE FUNCTION mqtt_pub.mqtt_trigger_notify(%L, %L, %L, %L)',
         _trigger_name, _ops, table_name,
         _prefix, qos::text, broker, include_meta::text
     );
@@ -409,42 +394,50 @@ RETURNS void
 LANGUAGE plpgsql
 AS $func$
 DECLARE
-    _ops          text;
     _prefix       text;
     _trigger_name text;
     _referencing  text;
     _sql          text;
+    _op           text;
+    _count        integer := 0;
 BEGIN
     _prefix := COALESCE(topic_prefix, 'db/changes/' || table_name);
-    _ops := array_to_string(operations, ' OR ');
-    _trigger_name := 'mqtt_resultset_' || replace(table_name, '.', '_');
 
-    -- Build REFERENCING clause based on operations
-    _referencing := '';
-    IF 'DELETE' = ANY(operations) OR 'UPDATE' = ANY(operations) THEN
-        _referencing := _referencing || ' REFERENCING OLD TABLE AS old_table';
+    -- Create separate trigger for each operation (required for transition tables)
+    FOREACH _op IN ARRAY operations LOOP
+        _trigger_name := 'mqtt_resultset_' || replace(table_name, '.', '_') || '_' || lower(_op);
+
+        -- Set REFERENCING clause based on operation
+        CASE _op
+            WHEN 'INSERT' THEN
+                _referencing := ' REFERENCING NEW TABLE AS new_table';
+            WHEN 'DELETE' THEN
+                _referencing := ' REFERENCING OLD TABLE AS old_table';
+            WHEN 'UPDATE' THEN
+                _referencing := ' REFERENCING OLD TABLE AS old_table NEW TABLE AS new_table';
+            ELSE
+                RAISE EXCEPTION 'Invalid operation: %. Must be INSERT, UPDATE, or DELETE', _op;
+        END CASE;
+
+        _sql := format(
+            'CREATE OR REPLACE TRIGGER %I
+                 AFTER %s ON %s%s
+                 FOR EACH STATEMENT
+                 EXECUTE FUNCTION mqtt_pub.mqtt_trigger_notify_resultset(%L, %L, %L, %L)',
+            _trigger_name, _op, table_name, _referencing,
+            _prefix, qos::text, broker, include_meta::text
+        );
+
+        EXECUTE _sql;
+        _count := _count + 1;
+
+        RAISE NOTICE 'pg_mqtt_pub: resultset trigger "%" created for %',
+                     _trigger_name, _op;
+    END LOOP;
+
+    IF _count = 0 THEN
+        RAISE EXCEPTION 'No operations specified. operations array cannot be empty.';
     END IF;
-    IF 'INSERT' = ANY(operations) OR 'UPDATE' = ANY(operations) THEN
-        IF _referencing != '' THEN
-            _referencing := _referencing || ' NEW TABLE AS new_table';
-        ELSE
-            _referencing := ' REFERENCING NEW TABLE AS new_table';
-        END IF;
-    END IF;
-
-    _sql := format(
-        'CREATE OR REPLACE TRIGGER %I
-             AFTER %s ON %s%s
-             FOR EACH STATEMENT
-             EXECUTE FUNCTION mqtt_trigger_notify_resultset(%L, %L, %L, %L)',
-        _trigger_name, _ops, table_name, _referencing,
-        _prefix, qos::text, broker, include_meta::text
-    );
-
-    EXECUTE _sql;
-
-    RAISE NOTICE 'pg_mqtt_pub: resultset trigger "%" created on % for %',
-                 _trigger_name, table_name, _ops;
 END;
 $func$;
 
