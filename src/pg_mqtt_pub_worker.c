@@ -463,7 +463,10 @@ drain_outbox(void)
         return 0;
     }
 
-    /* Allocate memory for message results */
+    /* Allocate memory for message results.
+     * Memory is bounded: SELECT query has LIMIT pgmqttpub_outbox_batch_size (default 500).
+     * Max allocation: 500 messages × ~1069 bytes/message ≈ 534 KB.
+     * Memory is contained within drain_context and automatically freed below. */
     messages = palloc(processed * sizeof(MessageInfo));
     num_messages = processed;
 
@@ -507,6 +510,8 @@ drain_outbox(void)
     /* NOW do the DML operations after we've finished with the SELECT cursor */
     for (i = 0; i < num_messages; i++)
     {
+        int ret;
+
         SetCurrentStatementStartTimestamp();
         StartTransactionCommand();
         SPI_connect();
@@ -514,12 +519,22 @@ drain_outbox(void)
 
         if (messages[i].success)
         {
-            /* Delete successful messages */
-            char dml[128];
-            snprintf(dml, sizeof(dml),
-                     "DELETE FROM mqtt_pub.outbox WHERE id = %ld", (long)messages[i].id);
-            SPI_execute(dml, false, 0);
-            pg_atomic_fetch_sub_u64(&pgmqttpub_shared->outbox_pending, 1);
+            /* Delete successful messages using parameterized query */
+            Oid argtypes[1] = { INT8OID };
+            Datum values[1];
+            char nulls[1] = { ' ' };
+
+            values[0] = Int64GetDatum(messages[i].id);
+
+            ret = SPI_execute_with_args(
+                "DELETE FROM mqtt_pub.outbox WHERE id = $1",
+                1, argtypes, values, nulls, false, 0);
+
+            if (ret != SPI_OK_DELETE)
+                elog(WARNING, "pg_mqtt_pub: DELETE failed (rc=%d) for message id=%ld",
+                     ret, messages[i].id);
+            else
+                pg_atomic_fetch_sub_u64(&pgmqttpub_shared->outbox_pending, 1);
         }
         else
         {
@@ -527,34 +542,61 @@ drain_outbox(void)
 
             if (new_attempts >= pgmqttpub_poison_max_attempts)
             {
-                /* Dead-letter the message */
-                char dml[512];
+                /* Dead-letter the message using parameterized INSERT */
                 BrokerHandle *h = find_handle_for_broker(messages[i].broker_name);
+                const char *error_msg = h ? pgmqttpub_shared->broker_states[h->broker_idx].last_error
+                                         : "broker not found";
 
-                snprintf(dml, sizeof(dml),
-                         "INSERT INTO mqtt_pub.dead_letters "
-                         "(original_id, broker_name, topic, payload, qos, retain, "
-                         " attempts, first_failed_at, last_error) "
-                         "SELECT id, broker_name, topic, payload, qos, retain, "
-                         "       %d, created_at, '%s' "
-                         "FROM mqtt_pub.outbox WHERE id = %ld",
-                         new_attempts,
-                         h ? pgmqttpub_shared->broker_states[h->broker_idx].last_error
-                           : "broker not found",
-                         (long)messages[i].id);
-                SPI_execute(dml, false, 0);
+                Oid argtypes[4] = { INT8OID, INT4OID, TEXTOID, INT8OID };
+                Datum values[4];
+                char nulls[4] = { ' ', ' ', ' ', ' ' };
 
-                snprintf(dml, sizeof(dml),
-                         "DELETE FROM mqtt_pub.outbox WHERE id = %ld", (long)messages[i].id);
-                SPI_execute(dml, false, 0);
+                values[0] = Int64GetDatum(messages[i].id);
+                values[1] = Int32GetDatum(new_attempts);
+                values[2] = CStringGetTextDatum(error_msg);
+                values[3] = Int64GetDatum(messages[i].id);
 
-                pg_atomic_fetch_sub_u64(&pgmqttpub_shared->outbox_pending, 1);
-                pg_atomic_fetch_add_u64(&pgmqttpub_shared->total_dead_lettered, 1);
+                ret = SPI_execute_with_args(
+                    "INSERT INTO mqtt_pub.dead_letters "
+                    "(original_id, broker_name, topic, payload, qos, retain, "
+                    " attempts, first_failed_at, last_error) "
+                    "SELECT id, broker_name, topic, payload, qos, retain, "
+                    "       $2, created_at, $3 "
+                    "FROM mqtt_pub.outbox WHERE id = $4",
+                    4, argtypes, values, nulls, false, 0);
 
-                if (h)
+                if (ret != SPI_OK_INSERT)
                 {
-                    PgMqttPubBrokerState *bs = &pgmqttpub_shared->broker_states[h->broker_idx];
-                    bs->messages_dead_lettered++;
+                    elog(WARNING, "pg_mqtt_pub: INSERT to dead_letters failed (rc=%d) for message id=%ld",
+                         ret, messages[i].id);
+                }
+                else
+                {
+                    /* Now delete from outbox */
+                    Oid del_argtypes[1] = { INT8OID };
+                    Datum del_values[1];
+                    char del_nulls[1] = { ' ' };
+
+                    del_values[0] = Int64GetDatum(messages[i].id);
+
+                    ret = SPI_execute_with_args(
+                        "DELETE FROM mqtt_pub.outbox WHERE id = $1",
+                        1, del_argtypes, del_values, del_nulls, false, 0);
+
+                    if (ret != SPI_OK_DELETE)
+                        elog(WARNING, "pg_mqtt_pub: DELETE after dead-letter failed (rc=%d) for message id=%ld",
+                             ret, messages[i].id);
+                    else
+                    {
+                        pg_atomic_fetch_sub_u64(&pgmqttpub_shared->outbox_pending, 1);
+                        pg_atomic_fetch_add_u64(&pgmqttpub_shared->total_dead_lettered, 1);
+
+                        if (h)
+                        {
+                            PgMqttPubBrokerState *bs = &pgmqttpub_shared->broker_states[h->broker_idx];
+                            bs->messages_dead_lettered++;
+                        }
+                    }
                 }
 
                 elog(WARNING, "pg_mqtt_pub: dead-lettered message id=%ld "
@@ -563,21 +605,34 @@ drain_outbox(void)
             }
             else
             {
-                /* Retry with exponential backoff */
-                int  backoff_ms;
-                char dml[256];
+                /* Retry with exponential backoff using parameterized query */
+                int backoff_ms;
+                char backoff_interval[64];
+                Oid argtypes[3] = { INT4OID, TEXTOID, INT8OID };
+                Datum values[3];
+                char nulls[3] = { ' ', ' ', ' ' };
 
                 backoff_ms = PGMQTTPUB_POISON_BACKOFF_BASE_MS * (1 << (new_attempts - 1));
                 if (backoff_ms > PGMQTTPUB_POISON_BACKOFF_CAP_MS)
                     backoff_ms = PGMQTTPUB_POISON_BACKOFF_CAP_MS;
 
-                snprintf(dml, sizeof(dml),
-                         "UPDATE mqtt_pub.outbox "
-                         "SET attempts = %d, "
-                         "    next_retry_at = now() + interval '%d milliseconds' "
-                         "WHERE id = %ld",
-                         new_attempts, backoff_ms, (long)messages[i].id);
-                SPI_execute(dml, false, 0);
+                snprintf(backoff_interval, sizeof(backoff_interval),
+                         "%d milliseconds", backoff_ms);
+
+                values[0] = Int32GetDatum(new_attempts);
+                values[1] = CStringGetTextDatum(backoff_interval);
+                values[2] = Int64GetDatum(messages[i].id);
+
+                ret = SPI_execute_with_args(
+                    "UPDATE mqtt_pub.outbox "
+                    "SET attempts = $1, "
+                    "    next_retry_at = now() + interval $2 "
+                    "WHERE id = $3",
+                    3, argtypes, values, nulls, false, 0);
+
+                if (ret != SPI_OK_UPDATE)
+                    elog(WARNING, "pg_mqtt_pub: UPDATE (retry) failed (rc=%d) for message id=%ld",
+                         ret, messages[i].id);
             }
         }
 
@@ -623,23 +678,31 @@ static void
 prune_dead_letters(void)
 {
     int  ret;
-    char query[256];
+    Oid  argtypes[1] = { INT4OID };
+    Datum values[1];
+    char nulls[1] = { ' ' };
 
     SetCurrentStatementStartTimestamp();
     StartTransactionCommand();
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
 
-    snprintf(query, sizeof(query),
-             "DELETE FROM mqtt_pub.dead_letters "
-             "WHERE dead_lettered_at < now() - interval '%d days'",
-             pgmqttpub_dead_letter_retain_days);
+    values[0] = Int32GetDatum(pgmqttpub_dead_letter_retain_days);
 
-    ret = SPI_execute(query, false, 0);
+    ret = SPI_execute_with_args(
+        "DELETE FROM mqtt_pub.dead_letters "
+        "WHERE dead_lettered_at < now() - interval '1 day' * $1",
+        1, argtypes, values, nulls, false, 0);
 
-    if (ret == SPI_OK_DELETE && SPI_processed > 0)
+    if (ret != SPI_OK_DELETE)
+    {
+        elog(WARNING, "pg_mqtt_pub: prune dead letters failed (rc=%d)", ret);
+    }
+    else if (SPI_processed > 0)
+    {
         elog(LOG, "pg_mqtt_pub: pruned %lu expired dead letters",
              (unsigned long)SPI_processed);
+    }
 
     SPI_finish();
     PopActiveSnapshot();

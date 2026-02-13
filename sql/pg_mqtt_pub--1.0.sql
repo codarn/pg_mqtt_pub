@@ -27,10 +27,6 @@ COMMENT ON TABLE mqtt_pub.outbox IS
     'Durable message queue for MQTT publish when brokers are unavailable. '
     'Drained FIFO by the background worker on reconnection.';
 
--- Sequential drain index (worker reads oldest-first)
-CREATE INDEX outbox_drain_idx
-    ON mqtt_pub.outbox (id);
-
 -- Retry scheduling index (skip rows not yet eligible)
 CREATE INDEX outbox_retry_idx
     ON mqtt_pub.outbox (next_retry_at)
@@ -483,3 +479,25 @@ $func$;
 COMMENT ON FUNCTION mqtt_pub.replay_dead_letters IS
     'Move dead-lettered messages back to the outbox for retry. '
     'Optionally filter by broker name and limit count.';
+
+-- ═══════════════════════════════════════════
+--  Schema Permissions
+-- ═══════════════════════════════════════════
+
+GRANT USAGE ON SCHEMA mqtt_pub TO PUBLIC;
+GRANT SELECT ON mqtt_pub.outbox TO PUBLIC;
+GRANT SELECT ON mqtt_pub.dead_letters TO PUBLIC;
+GRANT SELECT ON mqtt_pub.outbox_summary TO PUBLIC;
+GRANT SELECT ON mqtt_pub.dead_letter_summary TO PUBLIC;
+
+GRANT EXECUTE ON FUNCTION mqtt_publish(text, text, integer, boolean, text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_publish_json(text, jsonb, integer, boolean, text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_publish_batch(text, text[], integer, boolean, text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_broker_add(text, text, integer, text, text, boolean, text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_broker_remove(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_trigger_notify() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_trigger_notify_resultset() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_trigger_event_setup(text, text, text[], integer, text, boolean) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_trigger_resultset_setup(text, text, text[], integer, text, boolean) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION mqtt_pub.replay_dead_letters(text, integer) TO PUBLIC;
