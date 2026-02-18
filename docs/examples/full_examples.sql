@@ -1,20 +1,32 @@
 -- ═══════════════════════════════════════════════════════════════
---  pg_mqtt_pub Examples — Hybrid Delivery Model
+--  pg_mqtt_pub Examples — Ring Buffer with libmosquitto Buffering
+-- ═══════════════════════════════════════════════════════════════
+--
+--  Architecture:
+--  - Ring buffer for inter-process transport (volatile, fast)
+--  - libmosquitto handles QoS 1/2 with automatic retries
+--  - Immediate dead-lettering on mosquitto_publish() failures
+--
+--  NOTE: Broker configuration is set in postgresql.conf (requires restart):
+--    pg_mqtt_pub.broker_host = 'localhost'
+--    pg_mqtt_pub.broker_port = 1883
+--    pg_mqtt_pub.broker_username = ''      # optional
+--    pg_mqtt_pub.broker_password = ''      # optional
+--    pg_mqtt_pub.broker_use_tls = false    # optional
+--    pg_mqtt_pub.broker_ca_cert = ''       # optional
 -- ═══════════════════════════════════════════════════════════════
 
 CREATE EXTENSION IF NOT EXISTS pg_mqtt_pub;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
 -- ───────────────────────────────────
--- 1. Verify delivery mode
+-- 1. Check broker status
 -- ───────────────────────────────────
 
-SELECT * FROM mqtt_pub.mqtt_status();
--- delivery_mode = 'hot' when brokers healthy
--- delivery_mode = 'cold' when broker(s) down
+SELECT * FROM mqtt_status();
 
 -- ───────────────────────────────────
--- 2. Event-based trigger setup (one message per row)
+-- 2. Basic trigger setup (publish on each row change)
 -- ───────────────────────────────────
 
 CREATE TABLE sensor_readings (
@@ -26,38 +38,6 @@ CREATE TABLE sensor_readings (
     recorded_at timestamptz DEFAULT now()
 );
 
-SELECT mqtt_pub.mqtt_trigger_event_setup('sensor_readings');
-
-INSERT INTO sensor_readings (sensor_id, value, location)
-VALUES ('temp-001', 23.5, 'server-room-a');
--- HOT mode: enqueued to ring buffer in ~0.1ms
--- COLD mode: inserted into mqtt_pub.outbox in ~2ms
--- Either way, the INSERT succeeds.
-
--- ───────────────────────────────────
--- 2b. Resultset trigger for batch operations (one message per statement)
--- ───────────────────────────────────
-
-CREATE TABLE inventory_items (
-    id          serial PRIMARY KEY,
-    sku         text UNIQUE NOT NULL,
-    quantity    integer NOT NULL DEFAULT 0,
-    updated_at  timestamptz DEFAULT now()
-);
-
--- Track batch inventory updates as single messages
-SELECT mqtt_pub.mqtt_trigger_resultset_setup(
-    'inventory_items',
-    'sync/inventory/batch',
-    '{UPDATE}',
-    2
-);
-
--- Batch update publishes ONE message with all affected rows
-UPDATE inventory_items SET quantity = quantity - 1
-WHERE sku IN ('ITEM001', 'ITEM002', 'ITEM003', 'ITEM004');
--- Publishes single message: {"_count": 4, "data": [{old: {...}, new: {...}}, ...]}
-
 -- ───────────────────────────────────
 -- 3. Threshold alert with QoS 2
 -- ───────────────────────────────────
@@ -66,8 +46,9 @@ CREATE OR REPLACE FUNCTION alert_high_temperature()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF NEW.value > 40.0 THEN
-        PERFORM mqtt_pub.mqtt_publish(
-            format('alerts/temperature/%s', NEW.sensor_id),
+        -- Publish alert with QoS 2 (higher reliability)
+        PERFORM mqtt_publish(
+            format('alerts/temperature/%s', NEW.sensor_id),  -- topic
             json_build_object(
                 'sensor_id', NEW.sensor_id,
                 'value',     NEW.value,
@@ -78,9 +59,9 @@ BEGIN
                 END,
                 'location',  NEW.location,
                 'timestamp', NEW.recorded_at
-            )::text,
-            2,
-            true
+            )::text,  -- payload
+            2,        -- qos
+            true      -- retain
         );
     END IF;
     RETURN NEW;
@@ -96,8 +77,8 @@ CREATE TRIGGER sensor_alert
 -- ───────────────────────────────────
 
 SELECT cron.schedule('mqtt-hourly-stats', '0 * * * *', $$
-    SELECT mqtt_pub.mqtt_publish(
-        'analytics/temperature/hourly',
+    SELECT mqtt_publish(
+        'analytics/temperature/hourly',  -- topic
         (
             SELECT json_build_object(
                 'period_start', date_trunc('hour', now() - interval '1 hour'),
@@ -116,13 +97,14 @@ SELECT cron.schedule('mqtt-hourly-stats', '0 * * * *', $$
                   AND recorded_at <  date_trunc('hour', now())
                 GROUP BY sensor_id
             ) agg
-        ),
-        1, true
+        ),  -- payload
+        1,   -- qos
+        true -- retain
     );
 $$);
 
 -- ───────────────────────────────────
--- 5. pg_cron: batch sync with outbox awareness
+-- 5. pg_cron: batch sync with dead letter awareness
 -- ───────────────────────────────────
 
 CREATE TABLE orders (
@@ -146,10 +128,10 @@ SELECT cron.schedule('mqtt-sync-orders', '*/5 * * * *', $$
     ),
     sent AS (
         SELECT b.id,
-               mqtt_pub.mqtt_publish(
-                   'erp/orders/' || b.id,
-                   b.payload,
-                   2
+               mqtt_publish(
+                   'erp/orders/' || b.id,  -- topic
+                   b.payload,  -- payload
+                   2           -- qos (higher reliability for order sync)
                ) as ok
         FROM batch b
     )
@@ -158,72 +140,43 @@ SELECT cron.schedule('mqtt-sync-orders', '*/5 * * * *', $$
 $$);
 
 -- ───────────────────────────────────
--- 6. Multi-broker routing
+-- 6. Monitor system
 -- ───────────────────────────────────
 
-SELECT mqtt_pub.mqtt_broker_add(
-    'cloud', 'mqtt.analytics.com',
-    8883, NULL::text, NULL::text, true, '/etc/ssl/ca.pem'
-);
+-- Broker status dashboard
+SELECT * FROM mqtt_status();
 
-SELECT mqtt_pub.mqtt_broker_add(
-    'edge', '192.168.1.100', 1883
-);
-
-CREATE OR REPLACE FUNCTION route_sensor_data()
-RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    -- Local edge broker (low latency, fire-and-forget)
-    PERFORM mqtt_pub.mqtt_publish(
-        'devices/' || NEW.sensor_id || '/reading',
-        json_build_object('value', NEW.value, 'ts', NEW.recorded_at)::text,
-        0,
-        false,
-        'edge'
-    );
-
-    -- Cloud broker (durable, higher QoS)
-    PERFORM mqtt_pub.mqtt_publish(
-        'ingest/sensors/' || NEW.sensor_id,
-        row_to_json(NEW)::text,
-        1,
-        false,
-        'cloud'
-    );
-
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER sensor_multi_route
-    AFTER INSERT ON sensor_readings
-    FOR EACH ROW EXECUTE FUNCTION route_sensor_data();
-
--- ───────────────────────────────────
--- 7. Monitor the hybrid system
--- ───────────────────────────────────
-
--- Dashboard query
+-- Connection uptime (how long connected)
 SELECT
-    broker_name, connected, delivery_mode,
-    messages_sent, messages_failed,
-    dead_lettered, outbox_pending, last_error
-FROM mqtt_pub.mqtt_status();
+    host, port, connected,
+    CASE
+        WHEN connected THEN
+            'Connected for ' || EXTRACT(EPOCH FROM (now() - connected_since))::integer || ' seconds'
+        WHEN disconnected_since IS NOT NULL THEN
+            'Disconnected for ' || EXTRACT(EPOCH FROM (now() - disconnected_since))::integer || ' seconds'
+        ELSE 'Never connected'
+    END as uptime_status
+FROM mqtt_status();
 
--- Outbox health
-SELECT * FROM mqtt_pub.outbox_summary;
+-- Message throughput and success rate
+SELECT
+    host, port,
+    messages_sent, messages_failed, dead_lettered,
+    ROUND(100.0 * messages_sent / NULLIF(messages_sent + messages_failed, 0), 2) as success_rate_pct,
+    queue_depth
+FROM mqtt_status();
 
--- Dead letter investigation
-SELECT id, topic, attempts, last_error, dead_lettered_at
+-- Dead letter summary
+SELECT * FROM mqtt_pub.dead_letter_summary;
+
+-- Dead letter investigation (with mosquitto error codes)
+SELECT id, topic, mosquitto_error_code, error_message, failed_at
 FROM mqtt_pub.dead_letters
-ORDER BY dead_lettered_at DESC
+ORDER BY failed_at DESC
 LIMIT 20;
 
--- Replay dead letters back to outbox
-SELECT mqtt_pub.replay_dead_letters('default', 50);
-
 -- ───────────────────────────────────
--- 8. pg_cron: self-monitoring
+-- 7. pg_cron: self-monitoring
 -- ───────────────────────────────────
 
 SELECT cron.schedule('mqtt-health-check', '* * * * *', $cron$
@@ -231,14 +184,22 @@ SELECT cron.schedule('mqtt-health-check', '* * * * *', $cron$
     DECLARE
         r record;
     BEGIN
-        FOR r IN SELECT * FROM mqtt_pub.mqtt_status() LOOP
+        FOR r IN SELECT * FROM mqtt_status() LOOP
+            -- Alert on broker disconnection
             IF NOT r.connected THEN
-                RAISE WARNING 'pg_mqtt_pub: broker "%" disconnected (mode=%, pending=%)',
-                    r.broker_name, r.delivery_mode, r.outbox_pending;
+                RAISE WARNING 'pg_mqtt_pub: broker at %:%  disconnected since %',
+                    r.host, r.port, r.disconnected_since;
             END IF;
+            -- Alert on dead lettered messages
             IF r.dead_lettered > 0 THEN
-                RAISE WARNING 'pg_mqtt_pub: % dead-lettered messages for broker "%"',
-                    r.dead_lettered, r.broker_name;
+                RAISE WARNING 'pg_mqtt_pub: % dead-lettered messages (%.2f%% failure rate)',
+                    r.dead_lettered,
+                    100.0 * r.messages_failed / NULLIF(r.messages_sent + r.messages_failed, 0);
+            END IF;
+            -- Alert on queue buildup
+            IF r.queue_depth > 100 THEN
+                RAISE WARNING 'pg_mqtt_pub: queue depth at % (worker may be slow)',
+                    r.queue_depth;
             END IF;
         END LOOP;
     END $code$;
