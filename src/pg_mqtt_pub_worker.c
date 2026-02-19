@@ -135,6 +135,16 @@ dead_letter_insert(const PgMqttPubMessage *const msg,
 
 		PushActiveSnapshot(GetTransactionSnapshot());
 
+		/* Set explicit search_path for defense-in-depth, even though we use
+		 * fully-qualified names. This ensures any triggers or constraints
+		 * can find mqtt_pub objects. */
+		ret = SPI_execute("SET LOCAL search_path = mqtt_pub, pg_catalog", false, 0);
+		if (ret < 0)
+		{
+			elog(WARNING, "pg_mqtt_pub: failed to set search_path: %d", ret);
+			/* Continue anyway since we use fully-qualified names */
+		}
+
 		values[0] = CStringGetTextDatum(msg->topic);
 		values[1] = CStringGetTextDatum(msg->payload);
 		values[2] = Int32GetDatum(msg->qos);
@@ -500,6 +510,13 @@ pgmqttpub_worker_main(Datum main_arg)
 	}
 	PG_END_TRY();
 
+	/* Log resolved configuration for diagnostics */
+	elog(LOG,
+		 "pg_mqtt_pub: connected to database '%s', broker at %s:%d",
+		 pgmqttpub_init_database ? pgmqttpub_init_database : "postgres",
+		 pgmqttpub_broker_host ? pgmqttpub_broker_host : "(not set)",
+		 pgmqttpub_broker_port);
+
 	/* Attach shared memory */
 	if (!pgmqttpub_shared)
 	{
@@ -557,8 +574,6 @@ pgmqttpub_worker_main(Datum main_arg)
 		{
 			for (drained = 0; drained < PGMQTTPUB_DRAIN_BATCH_SIZE && pgmqttpub_queue_pop(&msg); drained++)
 			{
-				dead_letter_insert(&msg, 0, "Testing dead-letter insert");
-
 				publish_message(mosq, &msg);
 			}
 			process_dead_letter_queue();

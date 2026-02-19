@@ -114,7 +114,10 @@ pg_mqtt_pub.broker_client_key = ''               # Path to client private key fo
 
 ```ini
 pg_mqtt_pub.queue_size = 1024                    # Ring buffer capacity in slots (64-1048576)
-pg_mqtt_pub.init_database = 'postgres'           # Database for worker SPI operations (default: postgres)
+pg_mqtt_pub.init_database = 'postgres'           # Database where pg_mqtt_pub extension is installed
+                                                  # Worker connects to this database for dead_letters table
+                                                  # MUST match the database where you ran CREATE EXTENSION
+                                                  # (default: postgres)
 ```
 
 **Queue Size Notes:**
@@ -380,6 +383,61 @@ The extension creates the `mqtt_pub` schema containing:
 - Out of memory in libmosquitto
 
 Dead letters are retained for investigation and can be manually re-published via `mqtt_publish()` after fixing the underlying issue.
+
+## Troubleshooting
+
+### "relation mqtt_pub.dead_letters does not exist"
+
+This error indicates a configuration mismatch between where the extension is installed and where the worker connects.
+
+**Diagnosis:**
+
+Check which database has the extension installed:
+```sql
+SELECT datname,
+       (SELECT count(*) FROM pg_extension WHERE extname = 'pg_mqtt_pub') as has_extension
+FROM pg_database;
+```
+
+Check the worker's configured database:
+```sql
+SHOW pg_mqtt_pub.init_database;
+```
+
+**Solution:**
+
+Ensure `pg_mqtt_pub.init_database` in `postgresql.conf` matches the database where you ran `CREATE EXTENSION pg_mqtt_pub`.
+
+If you need to fix it:
+```sql
+-- In the database specified by pg_mqtt_pub.init_database
+DROP EXTENSION IF EXISTS pg_mqtt_pub CASCADE;
+CREATE EXTENSION pg_mqtt_pub;
+```
+
+Then restart PostgreSQL:
+```bash
+systemctl restart postgresql
+# or if using Docker:
+docker compose restart postgres
+```
+
+### Worker Not Starting
+
+Check PostgreSQL logs for detailed error messages:
+```bash
+# View recent logs
+tail -f /var/log/postgresql/postgresql.log
+
+# or if using Docker
+docker compose logs postgres | grep "pg_mqtt_pub"
+```
+
+Common issues:
+- Missing `pg_mqtt_pub` in `shared_preload_libraries` in `postgresql.conf`
+- Incorrect `pg_mqtt_pub.init_database` setting (see above)
+- Extension not installed in the init_database (see above)
+- Broker connection issues - check `pg_mqtt_pub.broker_host` and `pg_mqtt_pub.broker_port` are correct
 
 ## Docker Quick Start
 
