@@ -185,6 +185,61 @@ BEGIN
 END $$;
 ```
 
+### Stress Testing
+
+Use the `stress_test_mqtt()` function to validate throughput, latency, and reliability under load. This function generates and publishes sequential test messages to the `stress/test` topic.
+
+```sql
+-- Basic: publish 1000 messages as fast as possible
+SELECT * FROM stress_test_mqtt(1000);
+
+-- With batching: publish 1000 messages in batches of 100 with 10ms delay between batches
+SELECT * FROM stress_test_mqtt(
+    message_count := 1000,
+    batch_size := 100,
+    delay_ms := 10,
+    qos := 1
+);
+
+-- High volume: 10000 messages at QoS 1 with minimal throttling
+SELECT * FROM stress_test_mqtt(
+    message_count := 10000,
+    batch_size := 500,
+    delay_ms := 1,
+    qos := 1
+);
+```
+
+**Parameters:**
+- `message_count` — Total number of test messages to publish
+- `batch_size` — Publish this many messages before delaying (default: 1 = no batching)
+- `delay_ms` — Milliseconds to wait between batches (default: 1)
+- `qos` — MQTT QoS level: 0 (fire-and-forget), 1 (at-least-once), or 2 (exactly-once) (default: 0)
+
+**Returns:** Table with `msg_num` (message sequence number) and `result` (true if published successfully). Monitor results to detect publish failures:
+
+```sql
+-- Check for failed messages
+SELECT msg_num, result FROM stress_test_mqtt(1000) WHERE result = false;
+
+-- Summary of success rate
+SELECT
+    count(*) as total,
+    count(*) FILTER (WHERE result = true) as successful,
+    count(*) FILTER (WHERE result = false) as failed,
+    round(100.0 * count(*) FILTER (WHERE result = true) / count(*), 2) as success_rate_pct
+FROM stress_test_mqtt(1000);
+```
+
+**Monitor the broker connection during stress testing:**
+
+```sql
+-- In another session, watch status and dead letters in real-time
+SELECT
+    (SELECT * FROM mqtt_status()) as status,
+    (SELECT count(*) FROM mqtt_pub.dead_letters) as dead_letter_count;
+```
+
 ### Triggers
 
 #### Row-level trigger for specific updates

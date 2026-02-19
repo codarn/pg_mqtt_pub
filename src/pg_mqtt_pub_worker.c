@@ -104,24 +104,23 @@ increment_messages_dead_lettered(void)
 /* ───────── Dead Letter Insert ───────── */
 
 static void
-dead_letter_insert(const PgMqttPubMessage *msg,
-				   int mosq_error_code, const char *error_msg)
+dead_letter_insert(const PgMqttPubMessage *const msg,
+				   const int mosq_error_code, const char *const error_msg)
 {
-	int ret;
 	Oid argtypes[7] = {TEXTOID, TEXTOID, INT4OID, BOOLOID,
 					   INT4OID, TEXTOID, TIMESTAMPTZOID};
 	Datum values[7];
-	char nulls[7] = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
-	MemoryContext oldcontext, tmpcontext;
+	char nulls[7] = {0};
 
 	elog(LOG, "pg_mqtt_pub: inserting message into dead_letters (topic='%s', mosquitto_error_code=%d, error_message='%s')",
 		 msg->topic, mosq_error_code, error_msg);
 
 	/* Enter temporary memory context */
-	tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
-									   "dead_letter_insert",
-									   ALLOCSET_DEFAULT_SIZES);
-	oldcontext = MemoryContextSwitchTo(tmpcontext);
+	MemoryContext tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+													  "dead_letter_insert",
+													  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldcontext = MemoryContextSwitchTo(tmpcontext);
+	int ret;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -174,7 +173,7 @@ dead_letter_insert(const PgMqttPubMessage *msg,
 /* ───────── In-Flight Entry Creation ───────── */
 
 static InflightEntry *
-create_inflight_entry(const PgMqttPubMessage *msg)
+create_inflight_entry(const PgMqttPubMessage *const msg)
 {
 	InflightEntry *entry;
 
@@ -217,12 +216,8 @@ create_inflight_entry(const PgMqttPubMessage *msg)
 /* ───────── Publish Message ───────── */
 
 static bool
-publish_message(struct mosquitto *mosq, const PgMqttPubMessage *msg)
+publish_message(struct mosquitto *const mosq, const PgMqttPubMessage *const msg)
 {
-	int rc;
-	int payload_len;
-	InflightEntry *entry = NULL;
-
 	if (!mosq)
 	{
 		elog(ERROR, "pg_mqtt_pub: broker not initialized");
@@ -231,10 +226,11 @@ publish_message(struct mosquitto *mosq, const PgMqttPubMessage *msg)
 		return false;
 	}
 
-	entry = create_inflight_entry(msg);
+	InflightEntry *entry = create_inflight_entry(msg);
 
-	payload_len = strlen(msg->payload);
+	const int payload_len = strlen(msg->payload);
 
+	int rc;
 	if (entry)
 		rc = mosquitto_publish(mosq, &entry->mid, msg->topic, payload_len,
 							   msg->payload, msg->qos, msg->retain);
@@ -273,9 +269,9 @@ publish_message(struct mosquitto *mosq, const PgMqttPubMessage *msg)
 /* ───────── Broker Connection Callbacks ───────── */
 
 static void
-on_broker_connect(struct mosquitto *mosq, void *userdata, int rc)
+on_broker_connect(struct mosquitto *mosq, void *userdata, const int rc)
 {
-	MosqUserData *userdata_ctx = (MosqUserData *)userdata;
+	const MosqUserData *userdata_ctx = (const MosqUserData *)userdata;
 
 	if (rc == MOSQ_ERR_SUCCESS)
 	{
@@ -295,9 +291,9 @@ on_broker_connect(struct mosquitto *mosq, void *userdata, int rc)
 }
 
 static void
-on_broker_disconnect(struct mosquitto *mosq, void *userdata, int rc)
+on_broker_disconnect(struct mosquitto *mosq, void *userdata, const int rc)
 {
-	MosqUserData *userdata_ctx = (MosqUserData *)userdata;
+	const MosqUserData *userdata_ctx = (const MosqUserData *)userdata;
 
 	if (rc == MOSQ_ERR_SUCCESS)
 	{
@@ -320,16 +316,15 @@ on_broker_disconnect(struct mosquitto *mosq, void *userdata, int rc)
 
 static void
 on_publish_v5(struct mosquitto *mosq, void *userdata,
-			  int mid, int reason_code, const mosquitto_property *props)
+			  const int mid, const int reason_code, const mosquitto_property *props)
 {
-	dlist_mutable_iter iter;
-
 	elog(DEBUG1, "pg_mqtt_pub: publish callback received for mid=%d with reason_code=0x%02x",
 		 mid, reason_code);
 
 	pthread_mutex_lock(&lists_mutex);
 
 	/* Find entry with matching message ID in in-flight list */
+	dlist_mutable_iter iter;
 	dlist_foreach_modify(iter, &inflight_list)
 	{
 		InflightEntry *entry = dlist_container(InflightEntry, node, iter.cur);
@@ -378,24 +373,19 @@ on_publish_v5(struct mosquitto *mosq, void *userdata,
 static struct mosquitto *
 connect_broker(void)
 {
-	PgMqttPubBrokerConfig *config;
-	MosqUserData *userdata;
-	struct mosquitto *mosq;
-	char client_id[128];
-	int rc;
-
 	LWLockAcquire(pgmqttpub_shared->config_lock, LW_SHARED);
-	config = &pgmqttpub_shared->broker_config;
+	const PgMqttPubBrokerConfig *const config = &pgmqttpub_shared->broker_config;
 
 	/* Allocate and populate userdata while holding lock */
-	userdata = palloc(sizeof(MosqUserData));
+	MosqUserData *const userdata = palloc(sizeof(MosqUserData));
 	strlcpy(userdata->host, config->host, sizeof(userdata->host));
 	userdata->port = config->port;
 
 	/* Create mosquitto instance with client ID */
+	char client_id[128];
 	snprintf(client_id, sizeof(client_id), "pg_mqtt_pub_%d", MyProcPid);
 
-	mosq = mosquitto_new(client_id, false, (void *)userdata);
+	struct mosquitto *mosq = mosquitto_new(client_id, false, (void *)userdata);
 	if (!mosq)
 	{
 		LWLockRelease(pgmqttpub_shared->config_lock);
@@ -418,12 +408,12 @@ connect_broker(void)
 	/* Configure TLS if needed */
 	if (config->use_tls)
 	{
-		rc = mosquitto_tls_set(mosq,
-							   config->ca_cert_path[0] ? config->ca_cert_path : NULL,
-							   NULL,
-							   config->client_cert_path[0] ? config->client_cert_path : NULL,
-							   config->client_key_path[0] ? config->client_key_path : NULL,
-							   NULL);
+		int rc = mosquitto_tls_set(mosq,
+								   config->ca_cert_path[0] ? config->ca_cert_path : NULL,
+								   NULL,
+								   config->client_cert_path[0] ? config->client_cert_path : NULL,
+								   config->client_key_path[0] ? config->client_key_path : NULL,
+								   NULL);
 		if (rc != MOSQ_ERR_SUCCESS)
 		{
 			elog(WARNING, "pg_mqtt_pub: TLS setup failed: %s", mosquitto_strerror(rc));
@@ -441,7 +431,7 @@ connect_broker(void)
 		config->host, config->port);
 
 	/* Initiate async connection to broker */
-	rc = mosquitto_connect_async(mosq, config->host, config->port, 60);
+	int rc = mosquitto_connect_async(mosq, config->host, config->port, 60);
 	if (rc != MOSQ_ERR_SUCCESS)
 	{
 		elog(WARNING, "pg_mqtt_pub: mosquitto_connect_async failed: %s",
@@ -460,16 +450,14 @@ connect_broker(void)
 static void
 process_dead_letter_queue(void)
 {
-	InflightEntry *entry;
-
 	elog(DEBUG1, "pg_mqtt_pub: processing dead-letter queue");
 
 	pthread_mutex_lock(&lists_mutex);
 	while (!dlist_is_empty(&deadlettered_list))
 	{
 		/* Pop entry from dead-letter list */
-		entry = dlist_container(InflightEntry, node,
-								dlist_pop_head_node(&deadlettered_list));
+		InflightEntry *entry = dlist_container(InflightEntry, node,
+											   dlist_pop_head_node(&deadlettered_list));
 
 		/* Insert into database outside of the list lock */
 		pthread_mutex_unlock(&lists_mutex);
@@ -494,7 +482,7 @@ void
 pgmqttpub_worker_main(Datum main_arg)
 {
 	struct mosquitto *mosq = NULL;
-	PgMqttPubMessage msg;
+	PgMqttPubMessage msg = {0};
 
 	/* Setup signal handlers */
 	pqsignal(SIGTERM, pgmqttpub_sigterm_handler);

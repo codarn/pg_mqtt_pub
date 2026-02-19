@@ -61,9 +61,7 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static Size
 pgmqttpub_shmem_size(void)
 {
-    Size size;
-
-    size = sizeof(PgMqttPubSharedState);
+    Size size = sizeof(PgMqttPubSharedState);
     /* Flexible array member - ring buffer messages */
     size = add_size(size, mul_size(pgmqttpub_queue_size, sizeof(PgMqttPubMessage)));
     return size;
@@ -83,11 +81,9 @@ pgmqttpub_shmem_request(void)
 static void
 pgmqttpub_load_broker_config(void)
 {
-    PgMqttPubBrokerConfig config;
+    PgMqttPubBrokerConfig config = {0};
 
     /* Load broker configuration from GUC variables */
-    memset(&config, 0, sizeof(PgMqttPubBrokerConfig));
-
     strlcpy(config.name, "default", PGMQTTPUB_MAX_BROKER_NAME);
     strlcpy(config.host, pgmqttpub_broker_host, PGMQTTPUB_MAX_HOST_LEN);
     config.port = pgmqttpub_broker_port;
@@ -121,7 +117,7 @@ pgmqttpub_shmem_startup(void)
 
     if (!found)
     {
-        LWLockPadded *locks = GetNamedLWLockTranche("pg_mqtt_pub");
+        LWLockPadded *const locks = GetNamedLWLockTranche("pg_mqtt_pub");
 
         memset(pgmqttpub_shared, 0, pgmqttpub_shmem_size());
 
@@ -159,14 +155,9 @@ update_queue_depth_under_queue_lock(PgMqttPubQueue *q)
 }
 
 bool
-pgmqttpub_queue_push(const char *topic, const char *payload,
-                     int qos, bool retain)
+pgmqttpub_queue_push(const char *const topic, const char *const payload,
+                     const int qos, const bool retain)
 {
-    PgMqttPubQueue   *q;
-    PgMqttPubMessage msg = { 0 };
-    uint32            head, next;
-    PGPROC           *proc;
-
     if (!pgmqttpub_shared)
     {
         ereport(ERROR,
@@ -183,13 +174,15 @@ pgmqttpub_queue_push(const char *topic, const char *payload,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("pg_mqtt_pub: background worker not running")));
     }
-    proc = BackendPidGetProc(pgmqttpub_shared->worker_pid);
+    PGPROC *const proc = BackendPidGetProc(pgmqttpub_shared->worker_pid);
     LWLockRelease(pgmqttpub_shared->config_lock);
 
     /* Prepare message on stack before taking queue lock */
-    msg.magic = PGMQTTPUB_MAGIC;
-    msg.qos = qos;
-    msg.retain = retain;
+    PgMqttPubMessage msg = {
+        .magic = PGMQTTPUB_MAGIC,
+        .qos = qos,
+        .retain = retain,
+    };
 
     /* Validate and copy topic */
     if (strlen(topic) >= PGMQTTPUB_MAX_TOPIC_LEN)
@@ -212,11 +205,11 @@ pgmqttpub_queue_push(const char *topic, const char *payload,
     strlcpy(msg.payload, payload, PGMQTTPUB_MAX_PAYLOAD_LEN);
 
     /* Now acquire queue lock to place message */
-    q = &pgmqttpub_shared->queue;
+    PgMqttPubQueue *const q = &pgmqttpub_shared->queue;
     LWLockAcquire(q->lock, LW_EXCLUSIVE);
 
-    head = q->head;
-    next = (head + 1) % q->capacity;
+    const uint32 head = q->head;
+    const uint32 next = (head + 1) % q->capacity;
 
     if (next == q->tail)
     {
@@ -241,13 +234,10 @@ pgmqttpub_queue_push(const char *topic, const char *payload,
 bool
 pgmqttpub_queue_pop(PgMqttPubMessage *msg)
 {
-    PgMqttPubQueue *q;
-    uint32          tail, next;
-
     if (!pgmqttpub_shared)
         return false;
 
-    q = &pgmqttpub_shared->queue;
+    PgMqttPubQueue *const q = &pgmqttpub_shared->queue;
 
     LWLockAcquire(q->lock, LW_EXCLUSIVE);
 
@@ -258,8 +248,8 @@ pgmqttpub_queue_pop(PgMqttPubMessage *msg)
         return false;
     }
 
-    tail = q->tail;
-    next = (tail + 1) % q->capacity;
+    const uint32 tail = q->tail;
+    const uint32 next = (tail + 1) % q->capacity;
 
     /* Copy message from ring buffer array */
     *msg = pgmqttpub_shared->messages[tail];
@@ -288,29 +278,22 @@ PG_FUNCTION_INFO_V1(mqtt_status);
 Datum
 mqtt_publish(PG_FUNCTION_ARGS)
 {
-    text   *topic_text;
-    text   *payload_text;
-    int     qos;
-    bool    retain;
-    char   *topic, *payload;
-    bool    result;
-
     /* Topic is first required parameter */
     if (PG_ARGISNULL(0))
         ereport(ERROR,
                 (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
                  errmsg("pg_mqtt_pub: topic cannot be NULL")));
 
-    topic_text   = PG_GETARG_TEXT_PP(0);
+    const text *const topic_text = PG_GETARG_TEXT_PP(0);
 
     /* Payload with default */
-    payload_text = PG_ARGISNULL(1) ? cstring_to_text("") : PG_GETARG_TEXT_PP(1);
+    const text *const payload_text = PG_ARGISNULL(1) ? cstring_to_text("") : PG_GETARG_TEXT_PP(1);
 
     /* QoS with default */
-    qos          = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
+    int qos = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
 
     /* Retain with default */
-    retain       = PG_ARGISNULL(3) ? false : PG_GETARG_BOOL(3);
+    bool retain = PG_ARGISNULL(3) ? false : PG_GETARG_BOOL(3);
 
     if (qos < 0 || qos > 2)
     {
@@ -319,11 +302,11 @@ mqtt_publish(PG_FUNCTION_ARGS)
                  errmsg("pg_mqtt_pub: qos must be 0, 1, or 2")));
     }
 
-    topic   = text_to_cstring(topic_text);
-    payload = text_to_cstring(payload_text);
+    char *const topic = text_to_cstring(topic_text);
+    char *const payload = text_to_cstring(payload_text);
 
     /* Queue message to ring buffer */
-    result = pgmqttpub_queue_push(topic, payload, qos, retain);
+    bool result = pgmqttpub_queue_push(topic, payload, qos, retain);
 
     if (!result)
     {
@@ -386,23 +369,17 @@ mqtt_status(PG_FUNCTION_ARGS)
 
     if (call_cntr < 1 && pgmqttpub_shared->worker_pid)
     {
-        Datum      values[10];
-        bool       nulls[10];
-        HeapTuple  tuple;
-        PgMqttPubBrokerConfig *bc;
-        PgMqttPubBrokerState  *bs;
-        bool       is_connected;
-
-        memset(nulls, 0, sizeof(nulls));
+        Datum values[10];
+        bool nulls[10] = {false};
 
         /* Read broker state under shared lock for consistency */
         LWLockAcquire(pgmqttpub_shared->config_lock, LW_SHARED);
 
-        bc = &pgmqttpub_shared->broker_config;
-        bs = &pgmqttpub_shared->broker_state;
+        const PgMqttPubBrokerConfig *const bc = &pgmqttpub_shared->broker_config;
+        const PgMqttPubBrokerState  *const bs = &pgmqttpub_shared->broker_state;
 
         /* Compute connected: true if connected_since > disconnected_since */
-        is_connected = (bs->connected_since != 0 &&
+        bool is_connected = (bs->connected_since != 0 &&
                        (bs->disconnected_since == 0 ||
                         bs->connected_since > bs->disconnected_since));
 
@@ -428,7 +405,7 @@ mqtt_status(PG_FUNCTION_ARGS)
 
         LWLockRelease(pgmqttpub_shared->config_lock);
 
-        tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
+        HeapTuple tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
         SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
     }
 
@@ -444,7 +421,7 @@ void _PG_init(void);
 void
 _PG_init(void)
 {
-    BackgroundWorker worker;
+    BackgroundWorker worker = {0};
 
     if (!process_shared_preload_libraries_in_progress)
         return;
@@ -530,7 +507,6 @@ _PG_init(void)
 
     /* ── Register Single Background Worker ── */
 
-    memset(&worker, 0, sizeof(BackgroundWorker));
     snprintf(worker.bgw_name, BGW_MAXLEN, "pg_mqtt_pub worker");
     snprintf(worker.bgw_type, BGW_MAXLEN, "pg_mqtt_pub worker");
     snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_mqtt_pub");

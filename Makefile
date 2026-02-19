@@ -9,7 +9,7 @@ DATA = sql/pg_mqtt_pub--1.0.sql
 SHLIB_LINK = -lmosquitto
 
 PG_CPPFLAGS = -I$(shell pkg-config --cflags-only-I libmosquitto 2>/dev/null | sed 's/-I//g')
-PG_CFLAGS = -Wall -Wextra -Werror=implicit-function-declaration
+PG_CFLAGS = -std=c23 -Wall -Wextra -Wno-unused-parameter -Wno-declaration-after-statement -Werror=implicit-function-declaration
 
 REGRESS = pg_mqtt_pub_basic
 REGRESS_OPTS = --temp-config=$(srcdir)/test/pg_mqtt_pub_test.conf
