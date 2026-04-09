@@ -1,24 +1,11 @@
 /*
- * pg_mqtt_pub_worker.c — MQTT Background Worker (Hybrid Delivery)
+ * pg_mqtt_pub_worker.c — Single MQTT Broker Background Worker
  *
- * Main loop priority:
- *   1. Drain outbox table (cold path recovery, FIFO order preserved)
- *   2. Drain ring buffer (hot path, lowest latency)
- *
- * On broker disconnect:
- *   - Sets delivery_mode → COLD (routes new messages to outbox)
- *   - Attempts reconnection with exponential backoff
- *
- * On broker reconnect:
- *   - Drains ALL outbox rows first (preserving order from outage)
- *   - Only then sets delivery_mode → HOT
- *   - Resumes ring buffer consumption
- *
- * Poison message guardrails:
- *   - Each outbox row tracks `attempts` count
- *   - On publish failure, `attempts` is incremented with exponential next_retry_at
- *   - At max attempts (GUC configurable), row moves to mqtt_pub.dead_letters
- *   - Dead letters are retained for configurable days, then pruned
+ * Architecture:
+ *   - Single background worker manages one MQTT broker connection
+ *   - Worker drains shared ring buffer and publishes messages
+ *   - libmosquitto handles QoS, retries, buffering, and reconnection
+ *   - MQTT broker is responsible for routing to multiple downstream destinations
  *
  * Copyright (c) 2025, PostgreSQL License
  */
@@ -27,946 +14,600 @@
 
 #include "pg_mqtt_pub.h"
 
+#include "access/xact.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
-#include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
-#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
+#include "lib/ilist.h"
 
 #include <mosquitto.h>
 #include <signal.h>
+#include <pthread.h>
 
-/* ───────── Per-Broker Connection Handle ───────── */
+/* ───────── Worker State ───────── */
 
-typedef struct BrokerHandle
-{
-    struct mosquitto   *mosq;
-    int                 broker_idx;
-    TimestampTz         last_reconnect;
-    int                 reconnect_backoff_ms;
-    bool                connected;
-} BrokerHandle;
-
-/* ───────── Worker-local State ───────── */
-
-static volatile sig_atomic_t got_sighup  = false;
 static volatile sig_atomic_t got_sigterm = false;
 
-static BrokerHandle handles[PGMQTTPUB_MAX_BROKERS];
-static int          num_handles = 0;
+/* ───────── Mosquitto User Data ───────── */
 
-/* ───────── Signal Handlers ───────── */
+typedef struct {
+	char host[PGMQTTPUB_MAX_HOST_LEN];
+	int  port;
+} MosqUserData;
 
-static void
-pgmqttpub_sighup_handler(SIGNAL_ARGS)
+/* ───────── In-Flight Message Tracking ───────── */
+
+typedef struct InflightEntry
 {
-    int save_errno = errno;
-    got_sighup = true;
-    SetLatch(MyLatch);
-    errno = save_errno;
-}
+	dlist_node			node;			/* Link in dlist (inflight/unclaimed/deadlettered) */
+	int					mid;			/* Message ID from mosquitto */
+	int					reason_code;	/* -1 = awaiting callback, 0x00 = success, >=0x80 = error */
+	PgMqttPubMessage	message;		/* Full message (topic + payload) */
+} InflightEntry;
+
+static dlist_head inflight_list;       /* Entries awaiting MQTT ack */
+static dlist_head unclaimed_list;      /* Entries ready for reuse */
+static dlist_head deadlettered_list;   /* Entries waiting for DB insert (reason_code >= 0x80) */
+static pthread_mutex_t lists_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Memory context for in-flight entry allocations (only allocates, doesn't free) */
+static MemoryContext inflight_context = NULL;
+
+/* ───────── Signal Handler ───────── */
 
 static void
 pgmqttpub_sigterm_handler(SIGNAL_ARGS)
 {
-    int save_errno = errno;
-    got_sigterm = true;
-    SetLatch(MyLatch);
-    errno = save_errno;
+	int save_errno = errno;
+	got_sigterm = true;
+	SetLatch(MyLatch);
+	errno = save_errno;
 }
 
-/* ───────── Delivery Mode Transitions ───────── */
+/* ───────── Broker State Metrics ───────── */
+
+static inline void
+increment_messages_sent(void)
+{
+	LWLockAcquire(pgmqttpub_shared->config_lock, LW_EXCLUSIVE);
+	pgmqttpub_shared->broker_state.messages_sent++;
+	LWLockRelease(pgmqttpub_shared->config_lock);
+}
+
+static inline void
+increment_messages_failed(void)
+{
+	LWLockAcquire(pgmqttpub_shared->config_lock, LW_EXCLUSIVE);
+	pgmqttpub_shared->broker_state.messages_failed++;
+	LWLockRelease(pgmqttpub_shared->config_lock);
+}
+
+static inline void
+increment_messages_dead_lettered(void)
+{
+	LWLockAcquire(pgmqttpub_shared->config_lock, LW_EXCLUSIVE);
+	pgmqttpub_shared->broker_state.messages_dead_lettered++;
+	LWLockRelease(pgmqttpub_shared->config_lock);
+}
+
+
+/* ───────── Dead Letter Insert ───────── */
 
 static void
-switch_to_cold_mode(void)
+dead_letter_insert(const PgMqttPubMessage *const msg,
+				   const int mosq_error_code, const char *const error_msg)
 {
-    uint32 current = PGMQTTPUB_MODE_HOT;
+	Oid argtypes[7] = {TEXTOID, TEXTOID, INT4OID, BOOLOID,
+					   INT4OID, TEXTOID, TIMESTAMPTZOID};
+	Datum values[7];
+	char nulls[7] = {0};
 
-    if (pg_atomic_compare_exchange_u32(&pgmqttpub_shared->delivery_mode,
-                                        &current, PGMQTTPUB_MODE_COLD))
-    {
-        pgmqttpub_shared->mode_changed_at = GetCurrentTimestamp();
-        elog(LOG, "pg_mqtt_pub: switched to COLD mode (outbox table)");
-    }
+	elog(LOG, "pg_mqtt_pub: inserting message into dead_letters (topic='%s', mosquitto_error_code=%d, error_message='%s')",
+		 msg->topic, mosq_error_code, error_msg);
+
+	/* Enter temporary memory context */
+	MemoryContext tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+													  "dead_letter_insert",
+													  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldcontext = MemoryContextSwitchTo(tmpcontext);
+	int ret;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+
+	PG_TRY();
+	{
+		ret = SPI_connect();
+		if (ret != SPI_OK_CONNECT)
+		{
+			PG_RE_THROW();
+		}
+
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		/* Set explicit search_path for defense-in-depth, even though we use
+		 * fully-qualified names. This ensures any triggers or constraints
+		 * can find mqtt_pub objects. */
+		ret = SPI_execute("SET LOCAL search_path = mqtt_pub, pg_catalog", false, 0);
+		if (ret < 0)
+		{
+			elog(WARNING, "pg_mqtt_pub: failed to set search_path: %d", ret);
+			/* Continue anyway since we use fully-qualified names */
+		}
+
+		values[0] = CStringGetTextDatum(msg->topic);
+		values[1] = CStringGetTextDatum(msg->payload);
+		values[2] = Int32GetDatum(msg->qos);
+		values[3] = BoolGetDatum(msg->retain);
+		values[4] = Int32GetDatum(mosq_error_code);
+		values[5] = CStringGetTextDatum(error_msg);
+		values[6] = TimestampTzGetDatum(GetCurrentTimestamp());
+
+		ret = SPI_execute_with_args(
+			"INSERT INTO mqtt_pub.dead_letters "
+			"(topic, payload, qos, retain, "
+			" mosquitto_error_code, error_message, failed_at) "
+			"VALUES ($1, $2, $3, $4, $5, $6, $7)",
+			7, argtypes, values, nulls, false, 0);
+
+		SPI_finish();
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(tmpcontext);
+		AbortCurrentTransaction();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextDelete(tmpcontext);
+
+	/* Increment dead-lettered counter after successful insert */
+	increment_messages_dead_lettered();
 }
 
-static void
-switch_to_hot_mode(void)
-{
-    uint32 current = PGMQTTPUB_MODE_COLD;
+/* ───────── In-Flight Entry Creation ───────── */
 
-    if (pg_atomic_compare_exchange_u32(&pgmqttpub_shared->delivery_mode,
-                                        &current, PGMQTTPUB_MODE_HOT))
-    {
-        pgmqttpub_shared->mode_changed_at = GetCurrentTimestamp();
-        elog(LOG, "pg_mqtt_pub: switched to HOT mode (ring buffer)");
-    }
+static InflightEntry *
+create_inflight_entry(const PgMqttPubMessage *const msg)
+{
+	InflightEntry *entry;
+
+	if (msg->qos == 0)
+	{
+		/* QoS 0 does not require tracking */
+		return NULL;
+	}
+
+	pthread_mutex_lock(&lists_mutex);
+
+	/* Reuse from unclaimed pool if available */
+	if (!dlist_is_empty(&unclaimed_list))
+	{
+		entry = dlist_container(InflightEntry, node,
+								dlist_pop_head_node(&unclaimed_list));
+		elog(DEBUG3, "pg_mqtt_pub: reused in-flight entry from pool");
+	}
+	else
+	{
+		/* Only allocate if pool is empty */
+		pthread_mutex_unlock(&lists_mutex);
+		entry = (InflightEntry *) MemoryContextAlloc(inflight_context,
+													  sizeof(InflightEntry));
+		pthread_mutex_lock(&lists_mutex);
+		elog(DEBUG3, "pg_mqtt_pub: allocated new in-flight entry");
+	}
+
+	entry->mid = 0;  /* Will be set by mosquitto_publish */
+	entry->reason_code = -1;  /* Pending callback */
+	entry->message = *msg;
+
+	/* Add to in-flight list */
+	dlist_push_tail(&inflight_list, &entry->node);
+	pthread_mutex_unlock(&lists_mutex);
+
+	return entry;
 }
 
-/* ───────── Mosquitto Callbacks ───────── */
-
-static void
-on_connect(struct mosquitto *mosq, void *userdata, int reason_code)
-{
-    BrokerHandle      *h = (BrokerHandle *)userdata;
-    PgMqttPubBrokerState *bs;
-
-    if (!pgmqttpub_shared)
-        return;
-
-    bs = &pgmqttpub_shared->broker_states[h->broker_idx];
-
-    if (reason_code == 0)
-    {
-        h->connected = true;
-        h->reconnect_backoff_ms = pgmqttpub_reconnect_interval_ms;
-        bs->state = PGMQTTPUB_CONN_CONNECTED;
-        bs->connected_since = GetCurrentTimestamp();
-        bs->last_error[0] = '\0';
-
-        elog(LOG, "pg_mqtt_pub: connected to broker '%s' (%s:%d)",
-             pgmqttpub_shared->brokers[h->broker_idx].name,
-             pgmqttpub_shared->brokers[h->broker_idx].host,
-             pgmqttpub_shared->brokers[h->broker_idx].port);
-
-        /* NOTE: do NOT switch to HOT here — outbox must be drained first.
-         * The main loop handles the HOT transition after outbox is empty. */
-    }
-    else
-    {
-        h->connected = false;
-        bs->state = PGMQTTPUB_CONN_ERROR;
-        snprintf(bs->last_error, sizeof(bs->last_error),
-                 "Connection refused: %s", mosquitto_connack_string(reason_code));
-
-        elog(WARNING, "pg_mqtt_pub: broker '%s' refused: %s",
-             pgmqttpub_shared->brokers[h->broker_idx].name,
-             mosquitto_connack_string(reason_code));
-    }
-}
-
-static void
-on_disconnect(struct mosquitto *mosq, void *userdata, int reason_code)
-{
-    BrokerHandle      *h = (BrokerHandle *)userdata;
-    PgMqttPubBrokerState *bs;
-
-    if (!pgmqttpub_shared)
-        return;
-
-    bs = &pgmqttpub_shared->broker_states[h->broker_idx];
-    h->connected = false;
-    bs->state = PGMQTTPUB_CONN_DISCONNECTED;
-    bs->disconnected_since = GetCurrentTimestamp();
-
-    /* Immediately switch to COLD mode so new messages go to outbox */
-    switch_to_cold_mode();
-
-    if (reason_code != 0)
-    {
-        snprintf(bs->last_error, sizeof(bs->last_error),
-                 "Unexpected disconnect: rc=%d", reason_code);
-        elog(WARNING, "pg_mqtt_pub: broker '%s' disconnected (rc=%d) — switched to COLD mode",
-             pgmqttpub_shared->brokers[h->broker_idx].name, reason_code);
-    }
-}
-
-static void
-on_publish(struct mosquitto *mosq, void *userdata, int mid)
-{
-    /* QoS 1/2 ack received — could track in-flight count here */
-}
-
-/* ───────── Connection Management ───────── */
-
-static void
-setup_broker_connection(int idx)
-{
-    PgMqttPubBrokerConfig *bc;
-    BrokerHandle          *h;
-    char                   client_id[128];
-
-    bc = &pgmqttpub_shared->brokers[idx];
-    h  = &handles[num_handles];
-
-    memset(h, 0, sizeof(BrokerHandle));
-    h->broker_idx = idx;
-    h->reconnect_backoff_ms = pgmqttpub_reconnect_interval_ms;
-
-    snprintf(client_id, sizeof(client_id), "pg_mqtt_pub_%s_%d",
-             bc->name, MyProcPid);
-
-    h->mosq = mosquitto_new(client_id, true, h);
-    if (!h->mosq)
-    {
-        elog(WARNING, "pg_mqtt_pub: failed to create mosquitto instance for '%s'",
-             bc->name);
-        return;
-    }
-
-    mosquitto_connect_callback_set(h->mosq, on_connect);
-    mosquitto_disconnect_callback_set(h->mosq, on_disconnect);
-    mosquitto_publish_callback_set(h->mosq, on_publish);
-
-    if (bc->username[0] != '\0')
-        mosquitto_username_pw_set(h->mosq, bc->username,
-                                  bc->password[0] ? bc->password : NULL);
-
-    if (bc->use_tls)
-    {
-        int rc = mosquitto_tls_set(h->mosq,
-                                    bc->ca_cert_path[0] ? bc->ca_cert_path : NULL,
-                                    NULL,
-                                    bc->client_cert_path[0] ? bc->client_cert_path : NULL,
-                                    bc->client_key_path[0] ? bc->client_key_path : NULL,
-                                    NULL);
-        if (rc != MOSQ_ERR_SUCCESS)
-            elog(WARNING, "pg_mqtt_pub: TLS setup failed for '%s': %s",
-                 bc->name, mosquitto_strerror(rc));
-
-        mosquitto_tls_opts_set(h->mosq, 1, NULL, NULL);
-    }
-
-    mosquitto_threaded_set(h->mosq, true);
-    num_handles++;
-}
-
-static void
-try_connect(BrokerHandle *h)
-{
-    PgMqttPubBrokerConfig *bc;
-    PgMqttPubBrokerState  *bs;
-    int                    rc;
-    TimestampTz            now;
-
-    bc = &pgmqttpub_shared->brokers[h->broker_idx];
-    bs = &pgmqttpub_shared->broker_states[h->broker_idx];
-    now = GetCurrentTimestamp();
-
-    if (h->last_reconnect != 0)
-    {
-        long secs;
-        int microsecs;
-        TimestampDifference(h->last_reconnect, now, &secs, &microsecs);
-
-        if ((secs * 1000 + microsecs / 1000) < h->reconnect_backoff_ms)
-            return;
-    }
-
-    h->last_reconnect = now;
-    bs->state = PGMQTTPUB_CONN_CONNECTING;
-
-    elog(LOG, "pg_mqtt_pub: connecting to '%s' at %s:%d",
-         bc->name, bc->host, bc->port);
-
-    rc = mosquitto_connect_async(h->mosq, bc->host, bc->port, 60);
-    if (rc != MOSQ_ERR_SUCCESS)
-    {
-        bs->state = PGMQTTPUB_CONN_ERROR;
-        snprintf(bs->last_error, sizeof(bs->last_error),
-                 "Connect failed: %s", mosquitto_strerror(rc));
-        h->reconnect_backoff_ms = Min(h->reconnect_backoff_ms * 2, 60000);
-
-        elog(WARNING, "pg_mqtt_pub: connect to '%s' failed: %s (retry in %dms)",
-             bc->name, mosquitto_strerror(rc), h->reconnect_backoff_ms);
-    }
-}
-
-static void
-refresh_broker_connections(void)
-{
-    int i;
-    int j;
-    bool found;
-
-    LWLockAcquire(pgmqttpub_shared->config_lock, LW_SHARED);
-
-    for (i = 0; i < PGMQTTPUB_MAX_BROKERS; i++)
-    {
-        if (!pgmqttpub_shared->brokers[i].active)
-            continue;
-
-        found = false;
-        for (j = 0; j < num_handles; j++)
-        {
-            if (handles[j].broker_idx == i)
-            { found = true; break; }
-        }
-
-        if (!found && num_handles < PGMQTTPUB_MAX_BROKERS)
-        {
-            LWLockRelease(pgmqttpub_shared->config_lock);
-            setup_broker_connection(i);
-            LWLockAcquire(pgmqttpub_shared->config_lock, LW_SHARED);
-        }
-    }
-
-    LWLockRelease(pgmqttpub_shared->config_lock);
-}
-
-/* ───────── Find Broker Handle by Name ───────── */
-
-static BrokerHandle *
-find_handle_for_broker(const char *name)
-{
-    int i;
-    for (i = 0; i < num_handles; i++)
-    {
-        PgMqttPubBrokerConfig *bc = &pgmqttpub_shared->brokers[handles[i].broker_idx];
-        if (strcmp(bc->name, name) == 0)
-            return &handles[i];
-    }
-    return NULL;
-}
-
-/* ───────── Publish to MQTT Broker ───────── */
+/* ───────── Publish Message ───────── */
 
 static bool
-publish_to_broker(const char *broker_name, const char *topic,
-                  const void *payload, int payload_len,
-                  int qos, bool retain)
+publish_message(struct mosquitto *const mosq, const PgMqttPubMessage *const msg)
 {
-    BrokerHandle      *h;
-    PgMqttPubBrokerState *bs;
-    int                rc;
+	if (!mosq)
+	{
+		elog(ERROR, "pg_mqtt_pub: broker not initialized");
+		increment_messages_failed();
+		dead_letter_insert(msg, -1, "Broker not initialized");
+		return false;
+	}
 
-    h = find_handle_for_broker(broker_name);
-    if (!h)
-    {
-        elog(WARNING, "pg_mqtt_pub: no broker '%s' found, message dropped", broker_name);
-        return false;
-    }
+	InflightEntry *entry = create_inflight_entry(msg);
 
-    bs = &pgmqttpub_shared->broker_states[h->broker_idx];
+	const int payload_len = strlen(msg->payload);
 
-    if (!h->connected)
-    {
-        bs->messages_failed++;
-        return false;
-    }
+	int rc;
+	if (entry)
+		rc = mosquitto_publish(mosq, &entry->mid, msg->topic, payload_len,
+							   msg->payload, msg->qos, msg->retain);
+	else
+		rc = mosquitto_publish(mosq, NULL, msg->topic, payload_len,
+							   msg->payload, msg->qos, msg->retain);
 
-    rc = mosquitto_publish(h->mosq, NULL, topic, payload_len, payload, qos, retain);
+	if (rc == MOSQ_ERR_SUCCESS)
+	{
+		increment_messages_sent();
+		return true;
+	}
 
-    if (rc == MOSQ_ERR_SUCCESS)
-    {
-        bs->messages_sent++;
-        return true;
-    }
+	elog(DEBUG1, "pg_mqtt_pub: publish failed for topic '%s' (QoS %d): %s",
+		msg->topic, msg->qos, mosquitto_strerror(rc));
 
-    bs->messages_failed++;
-    snprintf(bs->last_error, sizeof(bs->last_error),
-             "Publish failed: %s", mosquitto_strerror(rc));
-    return false;
+	/* Publish failed - move entry to unclaimed pool for reuse */
+	if (entry)
+	{
+		pthread_mutex_lock(&lists_mutex);
+		dlist_delete(&entry->node);
+		dlist_push_tail(&unclaimed_list, &entry->node);
+		pthread_mutex_unlock(&lists_mutex);
+	}
+
+	/* QoS 0 "at most once" does not guarantee delivery, dead-lettering is not applicable */
+	if (msg->qos > 0)
+	{
+		dead_letter_insert(msg, rc, mosquitto_strerror(rc));
+	}
+
+	increment_messages_failed();
+	return false;
 }
 
-/* ───────── Dispatch Ring Buffer Message ───────── */
-
-static bool
-dispatch_ringbuf_message(PgMqttPubMessage *msg)
-{
-    char topic[PGMQTTPUB_MAX_TOPIC_LEN + 1];
-    int  qos    = msg->flags & PGMQTTPUB_FLAG_QOS_MASK;
-    bool retain = (msg->flags & PGMQTTPUB_FLAG_RETAIN) != 0;
-
-    memcpy(topic, msg->data, msg->topic_len);
-    topic[msg->topic_len] = '\0';
-
-    return publish_to_broker(msg->broker_name, topic,
-                             msg->data + msg->topic_len,
-                             msg->payload_len, qos, retain);
-}
-
-/* ═══════════════════════════════════════════
- *  Outbox Drain — the core of the cold path
- *
- *  SELECT id, broker_name, topic, payload, qos, retain, attempts
- *  FROM mqtt_pub.outbox
- *  WHERE next_retry_at <= now()
- *  ORDER BY id
- *  LIMIT $batch_size
- *  FOR UPDATE SKIP LOCKED;
- *
- *  For each row:
- *    - Try publish to MQTT
- *    - Success → DELETE row, decrement outbox_pending
- *    - Failure:
- *        - attempts < max → UPDATE attempts++, set next_retry_at with backoff
- *        - attempts >= max → MOVE to dead_letters, log warning
- *
- *  Returns: number of rows successfully published
- * ═══════════════════════════════════════════ */
-
-static int
-drain_outbox(void)
-{
-    int  ret;
-    int  published = 0;
-    int  processed;
-    int  i;
-    char query[512];
-
-    /* Collect message info BEFORE any DML to avoid SPI cursor invalidation */
-    typedef struct {
-        int64 id;
-        char broker_name[PGMQTTPUB_MAX_BROKER_NAME];
-        char topic[PGMQTTPUB_MAX_TOPIC_LEN];
-        bool success;
-        int attempts;
-    } MessageInfo;
-    MessageInfo *messages = NULL;
-    int num_messages = 0;
-
-    /* Create a child memory context for this call to avoid accumulating memory
-     * in the long-running worker loop. All allocations will be automatically
-     * freed when we reset this context at the end. */
-    MemoryContext drain_context = AllocSetContextCreate(
-        CurrentMemoryContext,
-        "drain_outbox",
-        ALLOCSET_DEFAULT_MINSIZE,
-        ALLOCSET_DEFAULT_INITSIZE,
-        ALLOCSET_DEFAULT_MAXSIZE);
-    MemoryContext oldctx = MemoryContextSwitchTo(drain_context);
-
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
-
-    snprintf(query, sizeof(query),
-             "SELECT id, broker_name, topic, payload, qos, retain, attempts "
-             "FROM mqtt_pub.outbox "
-             "WHERE next_retry_at <= now() "
-             "ORDER BY id "
-             "LIMIT %d",
-             pgmqttpub_outbox_batch_size);
-
-    ret = SPI_execute(query, true, 0);
-    processed = SPI_processed;
-
-    if (ret != SPI_OK_SELECT || processed == 0)
-    {
-        SPI_finish();
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-
-        /* Clean up memory context before returning */
-        MemoryContextSwitchTo(oldctx);
-        MemoryContextReset(drain_context);
-        return 0;
-    }
-
-    /* Allocate memory for message results.
-     * Memory is bounded: SELECT query has LIMIT pgmqttpub_outbox_batch_size (default 500).
-     * Max allocation: 500 messages × ~1069 bytes/message ≈ 534 KB.
-     * Memory is contained within drain_context and automatically freed below. */
-    messages = palloc(processed * sizeof(MessageInfo));
-    num_messages = processed;
-
-    /* Process each message and collect results */
-    for (i = 0; i < processed; i++)
-    {
-        HeapTuple   tuple = SPI_tuptable->vals[i];
-        TupleDesc   tupdesc = SPI_tuptable->tupdesc;
-        bool        isnull;
-
-        int64  id          = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 1, &isnull));
-        char  *broker_name = SPI_getvalue(tuple, tupdesc, 2);
-        char  *topic       = SPI_getvalue(tuple, tupdesc, 3);
-        bytea *payload_b   = DatumGetByteaPP(SPI_getbinval(tuple, tupdesc, 4, &isnull));
-        int    qos         = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &isnull));
-        bool   retain      = DatumGetBool(SPI_getbinval(tuple, tupdesc, 6, &isnull));
-        int    attempts    = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 7, &isnull));
-
-        void  *payload_data = VARDATA_ANY(payload_b);
-        int    payload_len  = VARSIZE_ANY_EXHDR(payload_b);
-
-        /* Try to publish message */
-        bool ok = publish_to_broker(broker_name, topic, payload_data,
-                                     payload_len, qos, retain);
-
-        /* Store result for later processing */
-        messages[i].id = id;
-        strlcpy(messages[i].broker_name, broker_name, PGMQTTPUB_MAX_BROKER_NAME);
-        strlcpy(messages[i].topic, topic, PGMQTTPUB_MAX_TOPIC_LEN);
-        messages[i].success = ok;
-        messages[i].attempts = attempts;
-
-        if (ok)
-            published++;
-    }
-
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
-
-    /* NOW do the DML operations after we've finished with the SELECT cursor */
-    for (i = 0; i < num_messages; i++)
-    {
-        int ret;
-
-        SetCurrentStatementStartTimestamp();
-        StartTransactionCommand();
-        SPI_connect();
-        PushActiveSnapshot(GetTransactionSnapshot());
-
-        if (messages[i].success)
-        {
-            /* Delete successful messages using parameterized query */
-            Oid argtypes[1] = { INT8OID };
-            Datum values[1];
-            char nulls[1] = { ' ' };
-
-            values[0] = Int64GetDatum(messages[i].id);
-
-            ret = SPI_execute_with_args(
-                "DELETE FROM mqtt_pub.outbox WHERE id = $1",
-                1, argtypes, values, nulls, false, 0);
-
-            if (ret != SPI_OK_DELETE)
-                elog(WARNING, "pg_mqtt_pub: DELETE failed (rc=%d) for message id=%ld",
-                     ret, messages[i].id);
-            else
-                pg_atomic_fetch_sub_u64(&pgmqttpub_shared->outbox_pending, 1);
-        }
-        else
-        {
-            int new_attempts = messages[i].attempts + 1;
-
-            if (new_attempts >= pgmqttpub_poison_max_attempts)
-            {
-                /* Dead-letter the message using parameterized INSERT */
-                BrokerHandle *h = find_handle_for_broker(messages[i].broker_name);
-                const char *error_msg = h ? pgmqttpub_shared->broker_states[h->broker_idx].last_error
-                                         : "broker not found";
-
-                Oid argtypes[4] = { INT8OID, INT4OID, TEXTOID, INT8OID };
-                Datum values[4];
-                char nulls[4] = { ' ', ' ', ' ', ' ' };
-
-                values[0] = Int64GetDatum(messages[i].id);
-                values[1] = Int32GetDatum(new_attempts);
-                values[2] = CStringGetTextDatum(error_msg);
-                values[3] = Int64GetDatum(messages[i].id);
-
-                ret = SPI_execute_with_args(
-                    "INSERT INTO mqtt_pub.dead_letters "
-                    "(original_id, broker_name, topic, payload, qos, retain, "
-                    " attempts, first_failed_at, last_error) "
-                    "SELECT id, broker_name, topic, payload, qos, retain, "
-                    "       $2, created_at, $3 "
-                    "FROM mqtt_pub.outbox WHERE id = $4",
-                    4, argtypes, values, nulls, false, 0);
-
-                if (ret != SPI_OK_INSERT)
-                {
-                    elog(WARNING, "pg_mqtt_pub: INSERT to dead_letters failed (rc=%d) for message id=%ld",
-                         ret, messages[i].id);
-                }
-                else
-                {
-                    /* Now delete from outbox */
-                    Oid del_argtypes[1] = { INT8OID };
-                    Datum del_values[1];
-                    char del_nulls[1] = { ' ' };
-
-                    del_values[0] = Int64GetDatum(messages[i].id);
-
-                    ret = SPI_execute_with_args(
-                        "DELETE FROM mqtt_pub.outbox WHERE id = $1",
-                        1, del_argtypes, del_values, del_nulls, false, 0);
-
-                    if (ret != SPI_OK_DELETE)
-                        elog(WARNING, "pg_mqtt_pub: DELETE after dead-letter failed (rc=%d) for message id=%ld",
-                             ret, messages[i].id);
-                    else
-                    {
-                        pg_atomic_fetch_sub_u64(&pgmqttpub_shared->outbox_pending, 1);
-                        pg_atomic_fetch_add_u64(&pgmqttpub_shared->total_dead_lettered, 1);
-
-                        if (h)
-                        {
-                            PgMqttPubBrokerState *bs = &pgmqttpub_shared->broker_states[h->broker_idx];
-                            bs->messages_dead_lettered++;
-                        }
-                    }
-                }
-
-                elog(WARNING, "pg_mqtt_pub: dead-lettered message id=%ld "
-                     "topic='%s' after %d attempts",
-                     (long)messages[i].id, messages[i].topic, new_attempts);
-            }
-            else
-            {
-                /* Retry with exponential backoff using parameterized query */
-                int backoff_ms;
-                char backoff_interval[64];
-                Oid argtypes[3] = { INT4OID, TEXTOID, INT8OID };
-                Datum values[3];
-                char nulls[3] = { ' ', ' ', ' ' };
-
-                backoff_ms = PGMQTTPUB_POISON_BACKOFF_BASE_MS * (1 << (new_attempts - 1));
-                if (backoff_ms > PGMQTTPUB_POISON_BACKOFF_CAP_MS)
-                    backoff_ms = PGMQTTPUB_POISON_BACKOFF_CAP_MS;
-
-                snprintf(backoff_interval, sizeof(backoff_interval),
-                         "%d milliseconds", backoff_ms);
-
-                values[0] = Int32GetDatum(new_attempts);
-                values[1] = CStringGetTextDatum(backoff_interval);
-                values[2] = Int64GetDatum(messages[i].id);
-
-                ret = SPI_execute_with_args(
-                    "UPDATE mqtt_pub.outbox "
-                    "SET attempts = $1, "
-                    "    next_retry_at = now() + interval $2 "
-                    "WHERE id = $3",
-                    3, argtypes, values, nulls, false, 0);
-
-                if (ret != SPI_OK_UPDATE)
-                    elog(WARNING, "pg_mqtt_pub: UPDATE (retry) failed (rc=%d) for message id=%ld",
-                         ret, messages[i].id);
-            }
-        }
-
-        SPI_finish();
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-    }
-
-    /* Switch back to original context and clean up drain context.
-     * This automatically frees ALL memory allocated within drain_context,
-     * including the messages array and any other allocations. */
-    MemoryContextSwitchTo(oldctx);
-    MemoryContextReset(drain_context);
-
-    return published;
-}
-
-/* ───────── Check if ALL Brokers Are Connected ───────── */
-
-static bool
-all_brokers_connected(void)
-{
-    int i;
-    for (i = 0; i < num_handles; i++)
-    {
-        if (!handles[i].connected)
-            return false;
-    }
-    return (num_handles > 0);
-}
-
-/* ───────── Check if Outbox is Empty ───────── */
-
-static bool
-outbox_is_empty(void)
-{
-    return pg_atomic_read_u64(&pgmqttpub_shared->outbox_pending) == 0;
-}
-
-/* ───────── Dead Letter Pruning ───────── */
+/* ───────── Broker Connection Callbacks ───────── */
 
 static void
-prune_dead_letters(void)
+on_broker_connect(struct mosquitto *mosq, void *userdata, const int rc)
 {
-    int  ret;
-    Oid  argtypes[1] = { INT4OID };
-    Datum values[1];
-    char nulls[1] = { ' ' };
+	const MosqUserData *userdata_ctx = (const MosqUserData *)userdata;
 
-    SetCurrentStatementStartTimestamp();
-    StartTransactionCommand();
-    SPI_connect();
-    PushActiveSnapshot(GetTransactionSnapshot());
+	if (rc == MOSQ_ERR_SUCCESS)
+	{
+		elog(LOG, "pg_mqtt_pub: broker connected successfully (%s:%d)",
+			 userdata_ctx->host, userdata_ctx->port);
 
-    values[0] = Int32GetDatum(pgmqttpub_dead_letter_retain_days);
-
-    ret = SPI_execute_with_args(
-        "DELETE FROM mqtt_pub.dead_letters "
-        "WHERE dead_lettered_at < now() - interval '1 day' * $1",
-        1, argtypes, values, nulls, false, 0);
-
-    if (ret != SPI_OK_DELETE)
-    {
-        elog(WARNING, "pg_mqtt_pub: prune dead letters failed (rc=%d)", ret);
-    }
-    else if (SPI_processed > 0)
-    {
-        elog(LOG, "pg_mqtt_pub: pruned %lu expired dead letters",
-             (unsigned long)SPI_processed);
-    }
-
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
+		/* Update connection timestamp in shared state */
+		LWLockAcquire(pgmqttpub_shared->config_lock, LW_EXCLUSIVE);
+		pgmqttpub_shared->broker_state.connected_since = GetCurrentTimestamp();
+		LWLockRelease(pgmqttpub_shared->config_lock);
+	}
+	else
+	{
+		elog(WARNING, "pg_mqtt_pub: broker connection failed (%s:%d): %s",
+			 userdata_ctx->host, userdata_ctx->port, mosquitto_strerror(rc));
+	}
 }
 
-/* ═══════════════════════════════════════════
- *  Background Worker Main Loop
- * ═══════════════════════════════════════════ */
+static void
+on_broker_disconnect(struct mosquitto *mosq, void *userdata, const int rc)
+{
+	const MosqUserData *userdata_ctx = (const MosqUserData *)userdata;
+
+	if (rc == MOSQ_ERR_SUCCESS)
+	{
+		elog(LOG, "pg_mqtt_pub: broker disconnected (%s:%d, client-initiated)",
+			 userdata_ctx->host, userdata_ctx->port);
+	}
+	else
+	{
+		elog(WARNING, "pg_mqtt_pub: broker disconnected unexpectedly (%s:%d): %s",
+			 userdata_ctx->host, userdata_ctx->port, mosquitto_strerror(rc));
+	}
+
+	/* Update disconnection timestamp in shared state (both clean and unexpected) */
+	LWLockAcquire(pgmqttpub_shared->config_lock, LW_EXCLUSIVE);
+	pgmqttpub_shared->broker_state.disconnected_since = GetCurrentTimestamp();
+	LWLockRelease(pgmqttpub_shared->config_lock);
+}
+
+/* ───────── Publish Callback (MQTT v5) ───────── */
+
+static void
+on_publish_v5(struct mosquitto *mosq, void *userdata,
+			  const int mid, const int reason_code, const mosquitto_property *props)
+{
+	elog(DEBUG1, "pg_mqtt_pub: publish callback received for mid=%d with reason_code=0x%02x",
+		 mid, reason_code);
+
+	pthread_mutex_lock(&lists_mutex);
+
+	/* Find entry with matching message ID in in-flight list */
+	dlist_mutable_iter iter;
+	dlist_foreach_modify(iter, &inflight_list)
+	{
+		InflightEntry *entry = dlist_container(InflightEntry, node, iter.cur);
+
+		if (entry->mid == mid)
+		{
+			if (reason_code == 0x00)
+			{
+				/* Success (MQTT v5 reason code 0x00) */
+				elog(DEBUG1, "pg_mqtt_pub: message %d acknowledged", entry->mid);
+				/* Remove from in-flight and move back to unclaimed pool */
+				dlist_delete(&entry->node);
+				dlist_push_tail(&unclaimed_list, &entry->node);
+			}
+			else if (entry->reason_code >= 0x80)
+			{
+				/* Failure (reason code >= 0x80 is error per MQTT 5.0 spec) */
+				elog(DEBUG1, "pg_mqtt_pub: message %d rejected by broker (reason_code=0x%02x)",
+					entry->mid, entry->reason_code);
+
+				/* Move from in-flight to dead-letter queue for DB insert */
+				dlist_delete(&entry->node);
+				dlist_push_tail(&deadlettered_list, &entry->node);
+			}
+			else
+			{
+				/* 0x01-0x7F: Info codes (e.g., no matching subscribers) */
+				elog(DEBUG1, "pg_mqtt_pub: message %d delivered with info code 0x%02x",
+					entry->mid, entry->reason_code);
+				/* Remove from in-flight and move back to unclaimed pool */
+				dlist_delete(&entry->node);
+				dlist_push_tail(&unclaimed_list, &entry->node);
+			}
+			break;
+		}
+	}
+
+	/* If not found, callback may have fired after message was cleaned up (race).
+	   This is benign—the message was already processed. */
+
+	pthread_mutex_unlock(&lists_mutex);
+}
+
+/* ───────── Connect to Broker ───────── */
+
+static struct mosquitto *
+connect_broker(void)
+{
+	LWLockAcquire(pgmqttpub_shared->config_lock, LW_SHARED);
+	const PgMqttPubBrokerConfig *const config = &pgmqttpub_shared->broker_config;
+
+	/* Allocate and populate userdata while holding lock */
+	MosqUserData *const userdata = palloc(sizeof(MosqUserData));
+	strlcpy(userdata->host, config->host, sizeof(userdata->host));
+	userdata->port = config->port;
+
+	/* Create mosquitto instance with client ID */
+	char client_id[128];
+	snprintf(client_id, sizeof(client_id), "pg_mqtt_pub_%d", MyProcPid);
+
+	struct mosquitto *mosq = mosquitto_new(client_id, false, (void *)userdata);
+	if (!mosq)
+	{
+		LWLockRelease(pgmqttpub_shared->config_lock);
+		elog(WARNING, "pg_mqtt_pub: mosquitto_new failed");
+		return NULL;
+	}
+
+	/* Set connection callbacks */
+	mosquitto_connect_callback_set(mosq, on_broker_connect);
+	mosquitto_disconnect_callback_set(mosq, on_broker_disconnect);
+
+	/* Set publish callback for QoS acknowledgments (MQTT v5) */
+	mosquitto_publish_v5_callback_set(mosq, on_publish_v5);
+
+	/* Set username/password if configured */
+	if (config->username[0] != '\0')
+		mosquitto_username_pw_set(mosq, config->username,
+								  config->password[0] ? config->password : NULL);
+
+	/* Configure TLS if needed */
+	if (config->use_tls)
+	{
+		int rc = mosquitto_tls_set(mosq,
+								   config->ca_cert_path[0] ? config->ca_cert_path : NULL,
+								   NULL,
+								   config->client_cert_path[0] ? config->client_cert_path : NULL,
+								   config->client_key_path[0] ? config->client_key_path : NULL,
+								   NULL);
+		if (rc != MOSQ_ERR_SUCCESS)
+		{
+			elog(WARNING, "pg_mqtt_pub: TLS setup failed: %s", mosquitto_strerror(rc));
+			mosquitto_destroy(mosq);
+			LWLockRelease(pgmqttpub_shared->config_lock);
+			return NULL;
+		}
+		mosquitto_tls_opts_set(mosq, 1, NULL, NULL);
+	}
+
+	/* Configure reconnection strategy */
+	mosquitto_reconnect_delay_set(mosq, 1, 60, true);
+
+	elog(LOG, "pg_mqtt_pub: connecting to %s:%d",
+		config->host, config->port);
+
+	/* Initiate async connection to broker */
+	int rc = mosquitto_connect_async(mosq, config->host, config->port, 60);
+	if (rc != MOSQ_ERR_SUCCESS)
+	{
+		elog(WARNING, "pg_mqtt_pub: mosquitto_connect_async failed: %s",
+			 mosquitto_strerror(rc));
+		mosquitto_destroy(mosq);
+		LWLockRelease(pgmqttpub_shared->config_lock);
+		return NULL;
+	}
+
+	LWLockRelease(pgmqttpub_shared->config_lock);
+	return mosq;
+}
+
+/* ───────── Process Dead-Letter Queue ───────── */
+
+static void
+process_dead_letter_queue(void)
+{
+	elog(DEBUG1, "pg_mqtt_pub: processing dead-letter queue");
+
+	pthread_mutex_lock(&lists_mutex);
+	while (!dlist_is_empty(&deadlettered_list))
+	{
+		/* Pop entry from dead-letter list */
+		InflightEntry *entry = dlist_container(InflightEntry, node,
+											   dlist_pop_head_node(&deadlettered_list));
+
+		/* Insert into database outside of the list lock */
+		pthread_mutex_unlock(&lists_mutex);
+
+		elog(DEBUG1, "pg_mqtt_pub: inserting dead-letter message (topic='%s', error_code=%d)",
+			 entry->message.topic, entry->reason_code);
+		dead_letter_insert(&entry->message, entry->reason_code,
+						   mosquitto_reason_string(entry->reason_code));
+
+		/* Reclaim the list lock */
+		pthread_mutex_lock(&lists_mutex);
+
+		/* Move entry to unclaimed pool for reuse */
+		dlist_push_tail(&unclaimed_list, &entry->node);
+	}
+	pthread_mutex_unlock(&lists_mutex);
+}
+
+/* ───────── Background Worker Main ───────── */
 
 void
 pgmqttpub_worker_main(Datum main_arg)
 {
-    PgMqttPubMessage msg;
-    TimestampTz      last_prune = 0;
-    int              i;
+	struct mosquitto *mosq = NULL;
+	PgMqttPubMessage msg = {0};
 
-    /* Signal handlers */
-    pqsignal(SIGHUP,  pgmqttpub_sighup_handler);
-    pqsignal(SIGTERM, pgmqttpub_sigterm_handler);
-    BackgroundWorkerUnblockSignals();
+	/* Setup signal handlers */
+	pqsignal(SIGTERM, pgmqttpub_sigterm_handler);
+	BackgroundWorkerUnblockSignals();
 
-    /* Connect to the configured outbox database for SPI access
-     * If the database doesn't exist yet (e.g., during initial startup),
-     * we'll retry on the next iteration. Don't fail fatally.
-     */
-    PG_TRY();
-    {
-        BackgroundWorkerInitializeConnection(pgmqttpub_outbox_database, NULL, 0);
-    }
-    PG_CATCH();
-    {
-        /* Database doesn't exist yet or other connection error - we'll retry later */
-        FlushErrorState();
-        /* Exit gracefully so we can retry */
-        return;
-    }
-    PG_END_TRY();
+	/* Connect to database */
+	PG_TRY();
+	{
+		BackgroundWorkerInitializeConnection(pgmqttpub_init_database, NULL, 0);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+		proc_exit(1);
+	}
+	PG_END_TRY();
 
-    /* Attach shared memory */
-    if (!pgmqttpub_shared)
-    {
-        bool found;
-        pgmqttpub_shared = ShmemInitStruct("pg_mqtt_pub",
-                                            sizeof(PgMqttPubSharedState),
-                                            &found);
-        if (!found)
-        {
-            elog(ERROR, "pg_mqtt_pub: shared memory not found");
-            proc_exit(1);
-        }
-    }
-    
-    pgmqttpub_shared->worker_running = true;
-    pgmqttpub_shared->worker_pid = MyProcPid;
+	/* Log resolved configuration for diagnostics */
+	elog(LOG,
+		 "pg_mqtt_pub: connected to database '%s', broker at %s:%d",
+		 pgmqttpub_init_database ? pgmqttpub_init_database : "postgres",
+		 pgmqttpub_broker_host ? pgmqttpub_broker_host : "(not set)",
+		 pgmqttpub_broker_port);
 
-    elog(LOG, "pg_mqtt_pub: background worker started (pid=%d)", MyProcPid);
+	/* Attach shared memory */
+	if (!pgmqttpub_shared)
+	{
+		bool found;
+		pgmqttpub_shared = ShmemInitStruct("pg_mqtt_pub",
+										  0,  /* Size not used when not found */
+										  &found);
+		if (!found)
+		{
+			elog(ERROR, "pg_mqtt_pub: shared memory not found");
+			proc_exit(1);
+		}
+	}
 
-    /* Initialize libmosquitto */
-    mosquitto_lib_init();
+	elog(LOG, "pg_mqtt_pub: worker started (pid=%d)", MyProcPid);
 
-    /* Check if outbox has pending rows from before crash/restart */
-    PG_TRY();
-    {
-        int ret;
-        SetCurrentStatementStartTimestamp();
-        StartTransactionCommand();
-        SPI_connect();
-        PushActiveSnapshot(GetTransactionSnapshot());
+	/* Initialize libmosquitto */
+	mosquitto_lib_init();
 
-        /* Check if extension exists first */
-        ret = SPI_execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_mqtt_pub'", true, 0);
-        if (ret != SPI_OK_SELECT || SPI_processed == 0)
-        {
-            /* Extension not installed - skip outbox check */
-            SPI_finish();
-            PopActiveSnapshot();
-            CommitTransactionCommand();
-            goto skip_outbox_check;
-        }
+	/* Initialize message tracking lists */
+	dlist_init(&inflight_list);
+	dlist_init(&unclaimed_list);
+	dlist_init(&deadlettered_list);
+	elog(DEBUG1, "pg_mqtt_pub: initialized in-flight, unclaimed, and dead-lettered lists");
 
-        ret = SPI_execute("SELECT count(*) FROM mqtt_pub.outbox", true, 0);
-        if (ret == SPI_OK_SELECT && SPI_processed > 0)
-        {
-            int64 pending = DatumGetInt64(
-                SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
-                              &(bool){false}));
-            pg_atomic_write_u64(&pgmqttpub_shared->outbox_pending, pending);
+	/* Create memory context for in-flight entries (batch freed after processing) */
+	inflight_context = AllocSetContextCreate(TopMemoryContext,
+											 "In-Flight Messages",
+											 ALLOCSET_DEFAULT_SIZES);
+	elog(DEBUG1, "pg_mqtt_pub: created in-flight message context");
 
-            if (pending > 0)
-            {
-                switch_to_cold_mode();
-                elog(LOG, "pg_mqtt_pub: found %ld pending outbox messages from prior session",
-                     (long)pending);
-            }
-        }
+	mosq = connect_broker();
+	if (!mosq)
+	{
+		elog(FATAL, "pg_mqtt_pub: failed to initialize broker, exiting");
+		proc_exit(0);
+	}
 
-        SPI_finish();
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-    }
-    PG_CATCH();
-    {
-        /* Extension not yet created in this database - silently continue */
-        FlushErrorState();
-        AbortCurrentTransaction();
-        elog(DEBUG1, "pg_mqtt_pub: outbox table not found, extension may not be created yet");
-    }
-    PG_END_TRY();
+	mosquitto_loop_start(mosq);
 
-skip_outbox_check:
-    /* Set up broker connections */
-    refresh_broker_connections();
+	/* Store our PID so backends can signal us (only after event loop is ready) */
+	LWLockAcquire(pgmqttpub_shared->config_lock, LW_EXCLUSIVE);
+	pgmqttpub_shared->worker_pid = MyProcPid;
+	LWLockRelease(pgmqttpub_shared->config_lock);
 
-    /* ── Main Loop ── */
+	/* ── Main Loop ── */
+	while (!got_sigterm)
+	{
+		elog(DEBUG1, "pg_mqtt_pub: waiting for latch");
+		ResetLatch(MyLatch);
 
-    while (!got_sigterm)
-    {
-        int  i;
-        int  rc;
-        int  messages_processed = 0;
-        bool any_disconnected = false;
+		/* Drain ring buffer in batches, yield to process dead-letter queue between batches */
+		int drained;
+		do
+		{
+			for (drained = 0; drained < PGMQTTPUB_DRAIN_BATCH_SIZE && pgmqttpub_queue_pop(&msg); drained++)
+			{
+				publish_message(mosq, &msg);
+			}
+			process_dead_letter_queue();
+		} while (drained >= PGMQTTPUB_DRAIN_BATCH_SIZE);
 
-        /* Handle config reload */
-        if (got_sighup)
-        {
-            got_sighup = false;
-            ProcessConfigFile(PGC_SIGHUP);
-            refresh_broker_connections();
-        }
+		/* Wait for work if no messages processed */
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, 0, PG_WAIT_EXTENSION);
+	}
 
-        /* Drive mosquitto event loops and attempt reconnects */
-        for (i = 0; i < num_handles; i++)
-        {
-            if (!handles[i].connected)
-            {
-                any_disconnected = true;
-                try_connect(&handles[i]);
-            }
+	/* ── Cleanup ── */
 
-            rc = mosquitto_loop(handles[i].mosq, 0, 1);
-            if (rc != MOSQ_ERR_SUCCESS && rc != MOSQ_ERR_CONN_LOST)
-                mosquitto_reconnect_async(handles[i].mosq);
-        }
+	elog(LOG, "pg_mqtt_pub: worker shutting down");
 
-        /* If any broker is down, ensure COLD mode */
-        if (any_disconnected)
-            switch_to_cold_mode();
+	if (mosq)
+	{
+		mosquitto_disconnect(mosq);
+		/* Drain any remaining events */
+		mosquitto_loop_stop(mosq, true);
+		mosquitto_destroy(mosq);
+	}
 
-        /*
-         * PRIORITY 1: Drain outbox (cold path recovery)
-         *
-         * We drain the outbox BEFORE touching the ring buffer.
-         * This preserves message ordering: outbox messages were
-         * enqueued earlier (during outage), so they must be
-         * delivered first.
-         */
-        if (!outbox_is_empty() && all_brokers_connected())
-        {
-            int drained = drain_outbox();
-            messages_processed += drained;
+	mosquitto_lib_cleanup();
 
-            /* If outbox is now empty AND all brokers connected → go HOT */
-            if (outbox_is_empty() && all_brokers_connected())
-                switch_to_hot_mode();
-        }
+	/* Cleanup in-flight message tracking */
+	process_dead_letter_queue();   /* Process any remaining dead-letter entries before shutdown */
 
-        /*
-         * PRIORITY 2: Drain ring buffer (hot path)
-         *
-         * Only process ring buffer if we're in HOT mode or if
-         * brokers are connected (handles stragglers from mode switch).
-         */
-        if (all_brokers_connected())
-        {
-            while (pgmqttpub_queue_pop(&msg))
-            {
-                if (!dispatch_ringbuf_message(&msg))
-                {
-                    /*
-                     * Ring buffer message failed to publish.
-                     * Spill it to the outbox for retry.
-                     */
-                    char topic[PGMQTTPUB_MAX_TOPIC_LEN + 1];
-                    int  qos    = msg.flags & PGMQTTPUB_FLAG_QOS_MASK;
-                    bool retain = (msg.flags & PGMQTTPUB_FLAG_RETAIN) != 0;
+	/* Delete in-flight context (frees all allocated entries) */
+	if (inflight_context)
+	{
+		MemoryContextDelete(inflight_context);
+		inflight_context = NULL;
+	}
 
-                    memcpy(topic, msg.data, msg.topic_len);
-                    topic[msg.topic_len] = '\0';
+	pthread_mutex_destroy(&lists_mutex);
 
-                    SetCurrentStatementStartTimestamp();
-                    StartTransactionCommand();
-                    SPI_connect();
-                    PushActiveSnapshot(GetTransactionSnapshot());
-
-                    pgmqttpub_outbox_insert(msg.broker_name, topic,
-                                             msg.data + msg.topic_len,
-                                             msg.payload_len, qos, retain);
-
-                    SPI_finish();
-                    PopActiveSnapshot();
-                    CommitTransactionCommand();
-
-                    switch_to_cold_mode();
-                    break; /* stop draining ring buffer, let outbox take over */
-                }
-
-                messages_processed++;
-
-                if (messages_processed % 1000 == 0)
-                {
-                    CHECK_FOR_INTERRUPTS();
-                    for (i = 0; i < num_handles; i++)
-                        mosquitto_loop(handles[i].mosq, 0, 1);
-                }
-            }
-        }
-
-        /* Periodic dead letter pruning (once per hour) */
-        {
-            TimestampTz now = GetCurrentTimestamp();
-            long secs;
-            int microsecs;
-
-            if (last_prune == 0)
-                last_prune = now;
-
-            TimestampDifference(last_prune, now, &secs, &microsecs);
-            if (secs >= 3600)
-            {
-                prune_dead_letters();
-                last_prune = now;
-            }
-        }
-
-        /* Wait for work */
-        if (messages_processed == 0)
-        {
-            int wait_ms = outbox_is_empty()
-                        ? pgmqttpub_worker_poll_interval_ms
-                        : PGMQTTPUB_OUTBOX_POLL_INTERVAL_MS;
-
-            (void) WaitLatch(MyLatch,
-                             WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-                             wait_ms,
-                             PG_WAIT_EXTENSION);
-            ResetLatch(MyLatch);
-        }
-    }
-
-    /* ── Cleanup ── */
-
-    elog(LOG, "pg_mqtt_pub: background worker shutting down");
-
-    for (i = 0; i < num_handles; i++)
-    {
-        if (handles[i].mosq)
-        {
-            mosquitto_disconnect(handles[i].mosq);
-            mosquitto_destroy(handles[i].mosq);
-        }
-    }
-
-    mosquitto_lib_cleanup();
-    pgmqttpub_shared->worker_running = false;
-    proc_exit(0);
+	proc_exit(0);
 }

@@ -1,8 +1,8 @@
-# ADR-001: Hybrid Delivery Model (Hot/Cold Path)
+# ADR-001: libmosquitto-Centric Message Delivery
 
-**Status:** Accepted  
-**Date:** 2026-02-13  
-**Deciders:** @fsjobeck, @crhaglun 
+**Status:** Accepted (Updated 2026-02-18)
+**Date:** 2026-02-13
+**Deciders:** @fsjobeck, @crhaglun
 
 ## Context
 
@@ -12,175 +12,158 @@ Three approaches were considered:
 
 1. **Ring buffer only** — shared memory, sub-millisecond, but volatile. Messages are lost on broker disconnect, Postgres crash, or restart.
 2. **Outbox table only** — WAL-backed, crash-safe, but adds 2-10ms of write latency to every trigger fire due to the additional table INSERT and WAL fsync.
-3. **Hybrid model** — ring buffer when healthy, outbox table during failures. Optimizes for the common case while providing durability when it matters.
+3. **Hybrid model with outbox** — ring buffer when healthy, outbox table during failures. Complex dual-path logic with mode transitions.
+
+Previous implementation attempted approach #3 but proved over-engineered and did not reliably handle mode transitions. Attempting to manage retries and backoff manually was error-prone and duplicated functionality that libmosquitto already provides.
 
 ## Decision
 
-We implement a **hybrid hot/cold delivery model** with automatic failover.
+We implement a **libmosquitto-centric architecture** that delegates all durability and retry logic to the MQTT client library, using MQTT's built-in QoS levels for ordering and delivery guarantees.
+
+Messages are queued into a fast in-memory ring buffer and delivered via libmosquitto. The library handles message buffering, retries, reconnection, and acknowledgment tracking. Failures at the `mosquitto_publish()` call level (connection down, malformed topic) are immediately dead-lettered.
 
 ### Architecture
 
 ```
-                      ┌─────────────────────┐
-                      │  delivery_mode flag  │
-                      │  (shared memory)     │
-                      └──────────┬──────────┘
-                                 │
-             ┌───── HOT ─────────┼────── COLD ──────┐
-             │                   │                   │
-             ▼                   │                   ▼
-   ┌──────────────────┐         │        ┌───────────────────┐
-   │  Ring Buffer      │         │        │  mqtt_pub.outbox   │
-   │  (shared memory)  │         │        │  (WAL-backed table)│
-   │  ~0.1ms latency   │         │        │  ~2-5ms latency    │
-   │  volatile          │         │        │  crash-safe        │
-   └────────┬─────────┘         │        └────────┬──────────┘
-            │                   │                  │
-            └───────────────────┼──────────────────┘
-                                │
-                                ▼
-                    ┌───────────────────────┐
-                    │  Background Worker     │
-                    │  drain order:          │
-                    │    1. outbox (FIFO)    │
-                    │    2. ring buffer      │
-                    └───────────┬───────────┘
-                                │
-                                ▼
-                         MQTT Broker(s)
+┌─────────────────────────────────────────────────────────────┐
+│  PostgreSQL Trigger / Function / pg_cron                   │
+│  CALL mqtt_publish(topic, payload, qos, retain)            │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+    ┌────────────────────────────────┐
+    │  Shared Memory Ring Buffer      │
+    │  • Fast, low-latency queue      │
+    │  • ~17 MB default (1024 slots)  │
+    │  • 16 KB max message size       │
+    └────────────────┬────────────────┘
+                     │
+                     ▼
+    ┌────────────────────────────────┐
+    │  Background Worker Process      │
+    │  • Drain ring buffer in batches │
+    │  • Call mosquitto_publish()     │
+    │  • Track QoS acks (MQTT v5)     │
+    │  • Handle dead letters          │
+    └────────────────┬────────────────┘
+                     │
+                     ▼
+    ┌────────────────────────────────┐
+    │  libmosquitto Client Library    │
+    │  • Internal message buffer      │
+    │  • QoS 1/2 delivery guarantees  │
+    │  • Automatic reconnection       │
+    │  • Persistent sessions          │
+    │  • TLS/SASL support             │
+    └────────────────┬────────────────┘
+                     │
+                     ▼
+           ┌──────────────────┐
+           │   MQTT Broker    │
+           │  (mosquitto,     │
+           │   HiveMQ, etc.)  │
+           └──────────────────┘
 ```
 
-### Mode Transitions
+### Message Delivery Flow
 
-```
-                    ┌───────────────────┐
-         ┌─────────│     HOT MODE       │
-         │         │  (ring buffer)     │
-         │         └─────────┬─────────┘
-         │                   │
-         │    broker disconnects OR
-         │    ring buffer full (spill)
-         │                   │
-         │                   ▼
-         │         ┌───────────────────┐
-         │         │    COLD MODE       │
-         └─────────│  (outbox table)   │
-   all brokers     └───────────────────┘
-   reconnected
-   AND outbox
-   fully drained
-```
+1. **Publish**: `mqtt_publish(topic, payload, qos, retain)` enqueues the message into the ring buffer.
 
-**HOT → COLD** triggers:
-- Any broker connection drops (on_disconnect callback)
-- Ring buffer is full (spill to outbox instead of blocking/dropping)
+2. **Worker drains**: Background worker pops messages in batches of 500 (configurable via `PGMQTTPUB_DRAIN_BATCH_SIZE`).
 
-**COLD → HOT** triggers (ALL conditions must be true):
-- Every configured broker is connected
-- The outbox table is completely empty (all pending rows drained)
+3. **libmosquitto delivery**:
+   - **QoS 0** ("at most once"): Message is sent immediately. No guarantee of delivery.
+   - **QoS 1** ("at least once"): libmosquitto waits for PUBACK from broker before considering it sent. Persists in client buffer across reconnects.
+   - **QoS 2** ("exactly once"): libmosquitto waits for full PUBCOMP handshake. Highest durability.
 
-The requirement that the outbox be fully drained before switching to HOT is critical for **message ordering**. Outbox messages were enqueued during the outage and must be delivered before any new ring buffer messages.
+4. **Acknowledgment**: For QoS 1/2, libmosquitto's callback (`on_publish_v5`) fires when the broker ACKs. Worker tracks this and removes the message from in-flight tracking.
 
-### Message Flow During Outage
+5. **Failure handling**: If `mosquitto_publish()` fails immediately (connection down, malformed topic, out of memory), the message is inserted into `mqtt_pub.dead_letters` with the mosquitto error code.
 
-```
-Time ──────────────────────────────────────────────────────►
+### Message Ordering
 
-t0: Broker connected. HOT mode. Trigger fires → ring buffer → broker. ✓
-t1: Broker disconnects. Worker sets COLD mode.
-t2: Trigger fires → outbox row #1 (WAL-durable)
-t3: Trigger fires → outbox row #2
-t4: Broker reconnects. Worker begins outbox drain.
-t5: Worker publishes outbox row #1 → broker. DELETE row #1. ✓
-t6: Trigger fires → outbox row #3 (still COLD, outbox not empty)
-t7: Worker publishes outbox row #2 → broker. DELETE row #2. ✓
-t8: Worker publishes outbox row #3 → broker. DELETE row #3. ✓
-t9: Outbox empty + all connected → switch to HOT.
-t10: Trigger fires → ring buffer → broker. ✓
-```
+Message ordering is preserved by libmosquitto's client-side queue, which delivers messages in the order they were submitted (subject to QoS guarantees).
 
-Messages #1, #2, #3 are delivered in order, and no message written during the outage is lost.
+- Within a single QoS level, messages are delivered in FIFO order
+- QoS 0 messages may be delivered out of order relative to QoS 1/2 if they overlap
+- Persistent sessions ensure messages survive broker restarts (QoS 1/2 only)
 
-## Poison Message Guardrails
+### Dead Letters
 
-A poison message is one that consistently fails to publish — malformed topic, oversized payload, broker-side ACL rejection, or a bug in the payload that triggers a broker disconnect.
+Immediate publish failures are recorded in `mqtt_pub.dead_letters` with:
+- `topic` and `payload` for identification
+- `qos` and `retain` flags
+- `mosquitto_error_code` — the numeric error from libmosquitto
+- `error_message` — human-readable error description
+- `failed_at` — timestamp of failure
 
-Without guardrails, a poison message would block the outbox drain forever: the worker retries it, fails, retries again, ad infinitum, while all messages behind it in the queue pile up.
-
-### Strategy: Exponential Backoff + Dead-Lettering
-
-```
-Attempt 1: fail → retry in 1s
-Attempt 2: fail → retry in 2s
-Attempt 3: fail → retry in 4s
-Attempt 4: fail → retry in 8s
-Attempt 5: fail → DEAD-LETTER (move to mqtt_pub.dead_letters)
-```
-
-Each outbox row tracks:
-- `attempts` — incremented on each failure
-- `next_retry_at` — set to `now() + backoff_ms` on failure
-
-The worker's drain query skips rows where `next_retry_at > now()`, so a failing message doesn't block other messages from being delivered. This is the key insight: **poison messages are time-displaced rather than queue-blocking**.
-
-### Dead Letter Table
-
-Messages that exceed `pg_mqtt_pub.poison_max_attempts` (default: 5) are moved to `mqtt_pub.dead_letters` with full diagnostic context:
-
-```sql
-SELECT id, topic, attempts, last_error, dead_lettered_at
-FROM mqtt_pub.dead_letters
-ORDER BY dead_lettered_at DESC;
-```
-
-Dead letters are:
-- **Retained** for `pg_mqtt_pub.dead_letter_retain_days` (default: 30)
-- **Auto-pruned** by the background worker hourly
-- **Replayable** via `mqtt_pub.replay_dead_letters()` which moves them back to the outbox with `attempts = 0`
-
-### Why Not Infinite Retry?
-
-A single poison message with infinite retry would:
-1. Consume a retry slot every backoff cycle
-2. Generate continuous WARNING logs
-3. Never deliver, wasting broker connection resources
-4. Create false confidence (the message appears "pending" but will never succeed)
-
-Dead-lettering makes the failure explicit and actionable. Operators see it in `mqtt_pub.dead_letter_summary`, get a WARNING in the PostgreSQL log, and can choose to fix and replay, or discard.
+Common reasons for dead-letter entries:
+- **Connection down at publish time** — broker is unreachable (typically transient; libmosquitto will retry later)
+- **Malformed topic** — contains null bytes or characters invalid per MQTT spec
+- **Payload too large** — exceeds 16 KB limit
+- **Out of memory in libmosquitto** — rare; indicates system stress
 
 ## Configuration
 
-| GUC | Default | Description |
-|-----|---------|-------------|
-| `pg_mqtt_pub.poison_max_attempts` | 5 | Delivery attempts before dead-lettering |
-| `pg_mqtt_pub.outbox_batch_size` | 500 | Max rows drained per worker cycle |
-| `pg_mqtt_pub.dead_letter_retain_days` | 30 | Auto-prune dead letters older than this |
-| `pg_mqtt_pub.publish_timeout_ms` | 100 | Ring buffer backpressure (0 = spill to outbox immediately) |
+| GUC | Default | Notes |
+|-----|---------|-------|
+| `pg_mqtt_pub.queue_size` | 1024 | Ring buffer slots (64–1,048,576); power of 2 recommended |
+| `pg_mqtt_pub.broker_host` | `localhost` | MQTT broker hostname or IP |
+| `pg_mqtt_pub.broker_port` | 1883 | MQTT port (1883 plain, 8883 TLS) |
+| `pg_mqtt_pub.broker_username` | (empty) | Authentication username |
+| `pg_mqtt_pub.broker_password` | (empty) | Authentication password |
+| `pg_mqtt_pub.broker_use_tls` | `false` | Enable TLS encryption |
+| `pg_mqtt_pub.broker_ca_cert` | (empty) | Path to CA certificate (PEM) |
+| `pg_mqtt_pub.broker_client_cert` | (empty) | Path to client cert (mutual TLS) |
+| `pg_mqtt_pub.broker_client_key` | (empty) | Path to client key (mutual TLS) |
+| `pg_mqtt_pub.init_database` | `postgres` | Database for worker SPI operations |
 
 ## Consequences
 
 ### Benefits
-- **Zero message loss** during broker outages (outbox is WAL-backed)
-- **Sub-millisecond latency** during normal operation (ring buffer hot path)
-- **Ordering preserved** across mode transitions (outbox drains before ring buffer resumes)
-- **No trigger failures** — DML never fails because of MQTT (worst case: outbox INSERT adds ~2ms)
-- **Crash recovery** — outbox rows survive Postgres restart; worker picks them up on startup
-- **Observable** — `mqtt_status()` shows delivery_mode, `mqtt_pub.outbox_summary` shows queue depth
+- **Simple architecture** — no dual-path mode switching logic; libmosquitto handles all durability
+- **Sub-millisecond latency** — ring buffer enqueue is ~0.1ms; no outbox table INSERT penalty during normal operation
+- **Message ordering preserved** — libmosquitto queues guarantee FIFO within QoS levels
+- **No trigger failures** — publish() succeeds or raises an error; DML is never blocked
+- **Automatic reconnection** — libmosquitto handles broker outages and reconnection with exponential backoff
+- **Persistent sessions** — QoS 1/2 messages survive broker/client restarts when broker supports persistence
+- **Observable** — `mqtt_status()` shows connection state, message counters, and queue depth
 
 ### Trade-offs
-- **Cold path latency** — outbox INSERT adds ~2-5ms per trigger fire during outages (acceptable; triggers complete, data is safe)
-- **Schema dependency** — extension creates tables in `mqtt_pub` schema (standard for PG extensions)
-- **Ring buffer messages in-flight at mode switch** — if the worker pops a ring buffer message but publish fails, it spills that message to the outbox. Brief reordering possible within the same millisecond window; practically negligible.
-- **Storage during extended outages** — outbox table grows unbounded during long outages. Monitor via `mqtt_pub.outbox_summary`. Consider adding a GUC for max outbox size in a future version.
+- **Volatile during outages** — QoS 0 messages are lost if the broker is unreachable. Triggers continue but messages don't survive.
+- **Broker connection required for QoS 1/2 delivery** — messages queue in libmosquitto's client buffer, but broker must be reachable for final delivery.
+- **No PostgreSQL-level durability** — messages don't write to WAL. A Postgres crash after `mqtt_publish()` returns but before the worker publishes could lose messages (in-flight window).
+- **Dead letters are minimal** — only immediate publish failures are captured; later failures during libmosquitto's retry loop are invisible (acceptable; libmosquitto owns retry logic).
+- **No per-broker routing** — single broker connection. Multiple brokers would require multiple extension instances or custom application logic.
+
+### Rationale for This Design Over Hot/Cold Hybrid
+
+The original hot/cold hybrid model had these issues:
+
+1. **Mode transition complexity** — the logic to detect when to switch modes and ensure ordering was fragile and error-prone.
+2. **Duplicated retry logic** — we were implementing exponential backoff and dead-lettering, which libmosquitto already does well via QoS levels.
+3. **Over-engineered for the common case** — most deployments have reliable brokers; the outbox table optimization for outages added code without benefit.
+4. **Testing burden** — mode transitions required complex test scenarios to validate.
+
+The libmosquitto-centric approach:
+- Delegates durability to a proven, battle-tested MQTT client library
+- Eliminates the need for mode switching logic
+- Reduces code by ~1000 lines
+- Achieves similar latency characteristics for the common case
+
+**Trade-off**: We lose WAL-backed durability for messages in flight. This is acceptable because:
+- QoS 1/2 messages are persisted by the broker (if broker supports persistence)
+- QoS 0 is best-effort; users should not rely on it for critical messages
+- Most PostgreSQL deployments can tolerate message loss during catastrophic failures (Postgres crash + lost in-flight)
 
 ### Not Addressed (Future Work)
-- **Per-broker mode** — currently mode is global. A single disconnected broker forces all traffic to cold path. Per-broker routing would allow healthy brokers to stay on hot path.
-- **Outbox size cap** — no maximum on outbox table size. Extended outages could grow it significantly.
-- **Exactly-once delivery** — not guaranteed. QoS 2 provides exactly-once at the MQTT protocol level, but replay from dead letters could cause duplicates at the application level. Consumers should be idempotent.
+- **Per-broker message routing** — currently supports single broker. Multiple brokers would require application-level routing or separate extension instances.
+- **Exactly-once delivery** — not guaranteed end-to-end. QoS 2 provides exactly-once at the protocol level, but replay from dead letters could cause duplicates. Consumers should be idempotent.
+- **Configurable batch size** — drain batch size (500) is compile-time constant. Could expose as GUC if deployments need tuning.
 
 ## References
 
-- [Transactional Outbox Pattern](https://microservices.io/patterns/data/transactional-outbox.html)
 - [MQTT QoS Levels](https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html)
+- [libmosquitto C Library](https://mosquitto.org/api/c/)
 - [PostgreSQL Background Workers](https://www.postgresql.org/docs/current/bgworker.html)
 - [PostgreSQL Shared Memory](https://www.postgresql.org/docs/current/spi.html)

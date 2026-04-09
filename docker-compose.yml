@@ -31,7 +31,7 @@ services:
         -c shared_preload_libraries='pg_mqtt_pub,pg_cron'
         -c pg_mqtt_pub.broker_host=mosquitto
         -c pg_mqtt_pub.broker_port=1883
-        -c pg_mqtt_pub.outbox_database=testdb
+        -c pg_mqtt_pub.init_database=testdb
         -c cron.database_name=testdb
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
